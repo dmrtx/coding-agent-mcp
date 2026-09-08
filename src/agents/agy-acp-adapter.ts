@@ -10,6 +10,8 @@ import {
   AgentContinueInput,
   type ManagedStartInput,
   type ManagedStartResult,
+  type ManagedContinueInput,
+  type ManagedContinueResult,
 } from "../domain/agent.js";
 import type { AgyAcpConfig } from "../config/schema.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
@@ -74,6 +76,12 @@ export interface AcpTurnOptions {
   env?: Record<string, string>;
   /** Optional model hint forwarded to `session/new`. */
   model?: string;
+  /**
+   * Existing session id to resume via `session/resume` instead of creating
+   * a new session via `session/new`. When omitted, a new session is created.
+   * When present, it must be non-empty after trimming.
+   */
+  sessionId?: string;
   /**
    * Workspace root the permission policy contains tool calls to. When
    * omitted, every inbound permission request is denied (fail-closed).
@@ -337,7 +345,9 @@ export class AgyAcpAdapter implements CodingAgent {
 
   /**
    * Spawn an ACP kernel over stdio and drive one
-   * `initialize -> session/new -> session/prompt` turn.
+   * `initialize -> session/new -> session/prompt` turn, or
+   * `initialize -> session/resume -> session/prompt` when
+   * `options.sessionId` names an existing session.
    *
    * Inbound `session/request_permission` probes (as emitted by the fake
    * kernel fixture) are answered with the real phase-1
@@ -354,6 +364,18 @@ export class AgyAcpAdapter implements CodingAgent {
     const prompt = options.prompt;
     if (typeof prompt !== "string" || prompt.length === 0) {
       throw new CodingAgentError(ErrorCodes.INTERNAL_ERROR, "AgyAcpAdapter requires a non-empty prompt", {});
+    }
+    // A resume request names an existing session; validate before spawning.
+    let resumeSessionId: string | undefined;
+    if (options.sessionId !== undefined) {
+      resumeSessionId = (options.sessionId ?? "").trim();
+      if (resumeSessionId.length === 0) {
+        throw new CodingAgentError(
+          ErrorCodes.TASK_NOT_RESUMABLE,
+          "AgyAcpAdapter requires a non-empty existing sessionId to resume a session",
+          { agent: this.id }
+        );
+      }
     }
     const configured = ((options.executable ?? this.config.acp_executable ?? "agy_acp_server") + "").trim();
     if (configured.length === 0) {
@@ -552,19 +574,41 @@ export class AgyAcpAdapter implements CodingAgent {
       void (async () => {
         try {
           await client.initialize({ protocolVersion: 1 });
-          const created = await client.sessionNew({
-            cwd,
-            ...(model ? { model } : {}),
-          });
-          const rawSessionId = (created as Record<string, unknown>).sessionId;
-          if (typeof rawSessionId !== "string" || rawSessionId.trim().length === 0) {
-            throw new CodingAgentError(
-              ErrorCodes.INTERNAL_ERROR,
-              "ACP session/new did not return a sessionId",
-              { agent: this.id }
-            );
+          let sessionId: string;
+          if (resumeSessionId !== undefined) {
+            // Continue path: resume the existing session. `session/new`
+            // must NOT be called here.
+            const resumed = (await client.sessionResume({
+              sessionId: resumeSessionId,
+            })) as Record<string, unknown>;
+            const returnedId = resumed.sessionId;
+            if (
+              typeof returnedId === "string" &&
+              returnedId.trim().length > 0 &&
+              returnedId.trim() !== resumeSessionId
+            ) {
+              throw new CodingAgentError(
+                ErrorCodes.INTERNAL_ERROR,
+                `ACP session/resume returned a different sessionId ('${returnedId.trim()}') than requested ('${resumeSessionId}')`,
+                { agent: this.id, requestedSessionId: resumeSessionId }
+              );
+            }
+            sessionId = resumeSessionId;
+          } else {
+            const created = await client.sessionNew({
+              cwd,
+              ...(model ? { model } : {}),
+            });
+            const rawSessionId = (created as Record<string, unknown>).sessionId;
+            if (typeof rawSessionId !== "string" || rawSessionId.trim().length === 0) {
+              throw new CodingAgentError(
+                ErrorCodes.INTERNAL_ERROR,
+                "ACP session/new did not return a sessionId",
+                { agent: this.id }
+              );
+            }
+            sessionId = rawSessionId.trim();
           }
-          const sessionId = rawSessionId.trim();
           const answer = (await client.sessionPrompt({
             sessionId,
             prompt,
@@ -652,6 +696,221 @@ export class AgyAcpAdapter implements CodingAgent {
           stopReason: "error",
           failureCode: ErrorCodes.INTERNAL_ERROR,
           failureMessage: message || "Managed ACP start failed",
+        };
+      }
+
+      const sessionId =
+        typeof turn.sessionId === "string" ? turn.sessionId : "";
+      const assistantText =
+        typeof turn.assistantText === "string" ? turn.assistantText : "";
+      const stopReason =
+        typeof turn.stopReason === "string" && turn.stopReason.length > 0
+          ? turn.stopReason
+          : "unknown";
+      const rawOutcome = (turn as unknown as Record<string, unknown>)
+        .permissionOutcome;
+      const outcome =
+        typeof rawOutcome === "string" ? rawOutcome.trim().toLowerCase() : "";
+      const lowerStop = stopReason.trim().toLowerCase();
+      const isDenyOutcome = outcome === "deny" || outcome === "denied";
+      const isDenialStop =
+        lowerStop === "deny" ||
+        lowerStop === "denied" ||
+        lowerStop === "permission_denied" ||
+        lowerStop === "permission-denied" ||
+        lowerStop === "policy_denied" ||
+        lowerStop === "policy-denied";
+      const hadDenyDecision = decisions.some((d) => d.decision === "deny");
+
+      if (assistantText.length > 0) {
+        try {
+          onOutput?.(assistantText);
+        } catch {
+          // Observer-only; ignore sink failures.
+        }
+      }
+
+      if (
+        stopReason === "cancelled" ||
+        lowerStop === "cancelled" ||
+        lowerStop === "canceled" ||
+        lowerStop === "cancel"
+      ) {
+        return {
+          status: "cancelled",
+          ...(sessionId ? { sessionId } : {}),
+          stopReason,
+          ...(assistantText.length > 0 ? { assistantText } : {}),
+        };
+      }
+
+      if (isDenyOutcome || isDenialStop) {
+        return {
+          status: "failed",
+          ...(sessionId ? { sessionId } : {}),
+          stopReason,
+          failureCode: ErrorCodes.POLICY_DENIED,
+          failureMessage: `ACP turn denied by permission policy (stopReason '${stopReason}')`,
+          failureDetails: {
+            stopReason,
+            ...(sessionId ? { sessionId } : {}),
+            ...(typeof rawOutcome === "string" && rawOutcome.length > 0
+              ? { permissionOutcome: rawOutcome }
+              : {}),
+          },
+        };
+      }
+
+      if (stopReason === "end_turn" && assistantText.trim().length > 0) {
+        return {
+          status: "completed",
+          sessionId,
+          sessionResumable: true,
+          assistantText,
+          stopReason,
+        };
+      }
+
+      if (stopReason === "end_turn") {
+        if (hadDenyDecision) {
+          return {
+            status: "failed",
+            ...(sessionId ? { sessionId } : {}),
+            stopReason,
+            failureCode: ErrorCodes.POLICY_DENIED,
+            failureMessage: `ACP turn denied by permission policy (stopReason '${stopReason}')`,
+            failureDetails: {
+              stopReason,
+              ...(sessionId ? { sessionId } : {}),
+            },
+          };
+        }
+        return {
+          status: "failed",
+          ...(sessionId ? { sessionId } : {}),
+          stopReason,
+          failureCode: ErrorCodes.INTERNAL_ERROR,
+          failureMessage: "ACP turn completed with empty assistant text",
+          failureDetails: {
+            stopReason,
+            ...(sessionId ? { sessionId } : {}),
+          },
+        };
+      }
+
+      if (hadDenyDecision) {
+        return {
+          status: "failed",
+          ...(sessionId ? { sessionId } : {}),
+          stopReason,
+          failureCode: ErrorCodes.POLICY_DENIED,
+          failureMessage: `ACP turn denied by permission policy (stopReason '${stopReason}')`,
+          failureDetails: {
+            stopReason,
+            ...(sessionId ? { sessionId } : {}),
+          },
+        };
+      }
+      return {
+        status: "failed",
+        ...(sessionId ? { sessionId } : {}),
+        stopReason,
+        failureCode: ErrorCodes.INTERNAL_ERROR,
+        failureMessage: `ACP turn ended with stopReason '${stopReason}'`,
+        failureDetails: {
+          stopReason,
+          ...(sessionId ? { sessionId } : {}),
+        },
+      };
+    } finally {
+      if (hadOwn) {
+        (this as unknown as Record<string, unknown>).decidePermissionRequest =
+          prevOwn;
+      } else {
+        delete (this as unknown as Record<string, unknown>)
+          .decidePermissionRequest;
+      }
+    }
+  }
+
+  /**
+   * Managed-continue hook (thin wrapper around `runAcpTurn` with resume).
+   *
+   * Maps `ManagedContinueInput` onto `runAcpTurn` options exactly like
+   * `runManagedStart`, plus the existing `sessionId`, which is resumed via
+   * `initialize -> session/resume -> session/prompt` (`session/new` is
+   * never called on this path). Streams only normalized assistant text
+   * plus permission decision lines through `onOutput` (never raw
+   * protocol), with result mapping identical to `runManagedStart`.
+   */
+  public async runManagedContinue(input: ManagedContinueInput): Promise<ManagedContinueResult> {
+    const requested = (input.sessionId ?? "").trim();
+    if (requested.length === 0) {
+      return {
+        status: "failed",
+        stopReason: "error",
+        failureCode: ErrorCodes.TASK_NOT_RESUMABLE,
+        failureMessage: "AgyAcpAdapter requires a non-empty existing sessionId to continue",
+        failureDetails: { taskId: input.taskId },
+      };
+    }
+    const onOutput = input.onOutput;
+    const decisions: AcpPermissionAnswer[] = [];
+    const boundDecide = this.decidePermissionRequest.bind(this);
+    const wrappedDecide = (
+      params: unknown,
+      context: AcpPermissionContext
+    ): AcpPermissionAnswer => {
+      const answer = boundDecide(params, context);
+      decisions.push(answer);
+      try {
+        onOutput?.(answer.reason);
+      } catch {
+        // Observer-only; a failing sink must not break the turn.
+      }
+      return answer;
+    };
+    const hadOwn = Object.prototype.hasOwnProperty.call(
+      this,
+      "decidePermissionRequest"
+    );
+    const prevOwn = (this as unknown as Record<string, unknown>)
+      .decidePermissionRequest;
+    (this as unknown as Record<string, unknown>).decidePermissionRequest =
+      wrappedDecide;
+    try {
+      let turn: AcpTurnResult;
+      try {
+        turn = await this.runAcpTurn({
+          prompt: input.instruction,
+          taskId: input.taskId,
+          workspaceRoot: input.workspaceRoot,
+          cwd: input.workspaceRoot,
+          mode: input.mode,
+          timeoutMs: input.timeoutMs,
+          baseEnv: input.environment,
+          allowWriteWorktree: this.config.allow_write_worktree ?? false,
+          sessionId: requested,
+        });
+      } catch (err) {
+        if (err instanceof CodingAgentError) {
+          return {
+            status: "failed",
+            stopReason: "error",
+            failureCode: err.code,
+            failureMessage: err.message,
+            ...(err.details !== undefined
+              ? { failureDetails: err.details }
+              : {}),
+          };
+        }
+        const message =
+          err instanceof Error ? err.message : String(err);
+        return {
+          status: "failed",
+          stopReason: "error",
+          failureCode: ErrorCodes.INTERNAL_ERROR,
+          failureMessage: message || "Managed ACP continue failed",
         };
       }
 
