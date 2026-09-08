@@ -707,6 +707,7 @@ export class AgyAcpAdapter implements CodingAgent {
           } else {
             const created = await client.sessionNew({
               cwd,
+              mcpServers: [],
               ...(model ? { model } : {}),
             });
             const rawSessionId = (created as Record<string, unknown>).sessionId;

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AgyAcpAdapter } from "../../src/agents/agy-acp-adapter.js";
+import { AcpClient } from "../../src/agents/acp/client.js";
 import { AgentRegistry } from "../../src/agents/agent-registry.js";
 import { AppConfigSchema } from "../../src/config/schema.js";
 import { CodingAgentError } from "../../src/domain/errors.js";
@@ -359,4 +360,36 @@ test("policy: fail-closed without mode, workspace, or auditable payload", () => 
   } finally {
     cleanup();
   }
+});
+
+test("session/new carries empty mcpServers for official-kernel compat", async () => {
+  assert.ok(fs.existsSync(FIXTURE), `fake kernel fixture must exist at ${FIXTURE}`);
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-mcp-ws-"));
+  fs.writeFileSync(path.join(workspace, "README.md"), "# test\n");
+  const adapter = new AgyAcpAdapter(makeConfig({ acp_executable: process.execPath }));
+  const orig = AcpClient.prototype.sessionNew;
+  let captured: unknown;
+  (AcpClient.prototype as unknown as Record<string, unknown>).sessionNew = function (
+    this: AcpClient,
+    params?: Record<string, unknown>,
+    options?: unknown
+  ) {
+    captured = params;
+    return orig.call(this, params, options as never);
+  };
+  try {
+    await adapter.runAcpTurn({
+      executable: process.execPath,
+      args: [FIXTURE],
+      prompt: "read the readme",
+      timeoutMs: 15_000,
+      workspaceRoot: workspace,
+      mode: "implement",
+    });
+  } finally {
+    (AcpClient.prototype as unknown as Record<string, unknown>).sessionNew = orig;
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+  assert.ok(captured !== null && typeof captured === "object", "session/new params must be captured");
+  assert.deepEqual((captured as Record<string, unknown>).mcpServers, []);
 });
