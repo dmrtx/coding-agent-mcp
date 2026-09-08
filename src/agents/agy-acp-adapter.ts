@@ -35,15 +35,23 @@ import {
  *   A missing binary reports `available: false` and every runtime use
  *   fails with a typed `CodingAgentError`. This adapter NEVER falls back
  *   to the legacy `agy` binary.
- * - Isolated per-task `HOME`/`GEMINI_HOME` under `state_dir` with
- *   restrictive permissions and ambient Google credential stripping.
- *   No host `HOME` credential reuse, no OAuth UI, no real auth yet.
+ * - Isolated per-task `HOME` under `state_dir` with a persistent
+ *   provider profile (`<state_dir>/profile/.gemini` as `GEMINI_HOME`)
+ *   shared across tasks, restrictive permissions, ambient Google
+ *   credential stripping, and forced file credential storage. No host
+ *   `HOME` credential reuse.
  * - One adapter-level ACP runtime helper (`runAcpTurn`) that spawns an
  *   ACP kernel over stdio (used with the existing fake kernel fixture in
- *   tests) and drives `initialize -> session/new -> session/prompt`.
- *   Inbound `session/request_permission` probes are answered with the
- *   real phase-1 `decideAcpToolPermission` policy (fail-closed when the
- *   mode/policy context is missing); there is no allow-all placeholder.
+ *   tests) and drives `initialize -> session/new -> session/prompt`
+ *   (or `initialize -> session/resume -> session/prompt` for continues).
+ *   On the official kernel's narrow auth-required failure (JSON-RPC
+ *   -32000 mentioning authentication/`authenticate`), exactly one ACP
+ *   `authenticate` (`{ methodId: <configured auth_method> }`) is sent
+ *   and the session call is retried exactly once; never preemptively,
+ *   never in a loop. Inbound `session/request_permission` probes are
+ *   answered with the real phase-1 `decideAcpToolPermission` policy
+ *   (fail-closed when the mode/policy context is missing); there is no
+ *   allow-all placeholder.
  */
 
 export interface AgyAcpIsolatedEnv {
@@ -51,6 +59,8 @@ export interface AgyAcpIsolatedEnv {
   taskDir: string;
   homeDir: string;
   geminiHome: string;
+  /** Persistent provider profile dir (`<state_dir>/profile`); `geminiHome` lives inside it. */
+  profileDir: string;
 }
 
 export interface AcpTurnResult {
@@ -173,6 +183,44 @@ function stripCredentialEnv(source: Record<string, string>): Record<string, stri
 }
 
 /**
+ * Narrow official-kernel auth-required detector for `session/new` and
+ * `session/resume` failures.
+ *
+ * True only when ALL hold:
+ * - a typed `CodingAgentError` from the ACP client,
+ * - JSON-RPC `code === -32000` in `details`,
+ * - `details.method` is `session/new` or `session/resume` (never
+ *   `authenticate` itself, so an authenticate failure cannot retrigger),
+ * - the message and/or `details.data` mentions authentication (covers
+ *   `Authentication required`, `call authenticate ...`, and the official
+ *   `auth.type` hint).
+ *
+ * Any other `-32000` (quota, unknown method, unrelated kernel errors)
+ * returns false and must surface unchanged without an `authenticate` call.
+ */
+export function isAcpAuthRequiredError(err: unknown): boolean {
+  if (!(err instanceof CodingAgentError)) return false;
+  const details = (err.details ?? {}) as Record<string, unknown>;
+  if (details.code !== -32000) return false;
+  const method = details.method;
+  if (method !== "session/new" && method !== "session/resume") return false;
+  const parts: string[] = [];
+  if (typeof err.message === "string" && err.message.length > 0) parts.push(err.message);
+  const data = details.data;
+  if (typeof data === "string") {
+    parts.push(data);
+  } else if (data !== undefined) {
+    try {
+      parts.push(JSON.stringify(data));
+    } catch {
+      parts.push(String(data));
+    }
+  }
+  const hay = parts.join("\n").toLowerCase();
+  return hay.includes("authenticat") || hay.includes("auth.type") || hay.includes("auth required");
+}
+
+/**
  * Safe availability probe for the configured ACP executable. Filesystem
  * only — never spawns the kernel, never touches the network, never falls
  * back to another binary.
@@ -267,13 +315,16 @@ export class AgyAcpAdapter implements CodingAgent {
   /**
    * Build an isolated per-task environment under `state_dir`.
    *
-   * Layout: `<state_dir>/tasks/<taskId>/home` becomes `HOME`, with
-   * `GEMINI_HOME` at `<home>/.gemini`. Directories are created `0700`
-   * (best-effort chmod on non-POSIX filesystems).
+   * Layout: `<state_dir>/tasks/<taskId>/home` becomes per-task `HOME`;
+   * `GEMINI_HOME` is one persistent provider profile at
+   * `<state_dir>/profile/.gemini` shared across tasks so official-kernel
+   * OAuth credentials survive per-task isolation. All directories are
+   * created `0700` (best-effort chmod on non-POSIX filesystems).
    *
    * Ambient `GOOGLE_*` / `GEMINI_*` / `ANTIGRAVITY_*` variables are
-   * stripped and host `HOME` credentials are never copied or reused.
-   * No OAuth UI or real auth is performed in this slice.
+   * stripped (including any host `GEMINI_HOME`) and host `HOME`
+   * credentials are never copied or reused. File credential storage is
+   * always forced via `AGY_ACP_FORCE_FILE_STORAGE=1`.
    */
   public buildIsolatedEnv(
     taskId: string,
@@ -290,9 +341,11 @@ export class AgyAcpAdapter implements CodingAgent {
     const stateDir = path.resolve(expandHomeDir(stateDirRaw));
     const taskDir = path.join(stateDir, "tasks", taskId);
     const homeDir = path.join(taskDir, "home");
-    const geminiHome = path.join(homeDir, ".gemini");
+    const profileDir = path.join(stateDir, "profile");
+    const geminiHome = path.join(profileDir, ".gemini");
 
     try {
+      fs.mkdirSync(homeDir, { recursive: true, mode: 0o700 });
       fs.mkdirSync(geminiHome, { recursive: true, mode: 0o700 });
     } catch (err: any) {
       throw new CodingAgentError(
@@ -303,6 +356,7 @@ export class AgyAcpAdapter implements CodingAgent {
     }
     chmodBestEffort(taskDir, 0o700);
     chmodBestEffort(homeDir, 0o700);
+    chmodBestEffort(profileDir, 0o700);
     chmodBestEffort(geminiHome, 0o700);
 
     const env: Record<string, string> = stripCredentialEnv(baseEnv);
@@ -312,7 +366,7 @@ export class AgyAcpAdapter implements CodingAgent {
     // T3 Code parity: the isolated kernel always uses file credential
     // storage; a host-provided value must never override this.
     env.AGY_ACP_FORCE_FILE_STORAGE = "1";
-    return { env, taskDir, homeDir, geminiHome };
+    return { env, taskDir, homeDir, geminiHome, profileDir };
   }
 
   /** Alias kept for test discoverability; identical to `buildIsolatedEnv`. */
@@ -321,6 +375,12 @@ export class AgyAcpAdapter implements CodingAgent {
     baseEnv: Record<string, string> = {}
   ): AgyAcpIsolatedEnv {
     return this.buildIsolatedEnv(taskId, baseEnv);
+  }
+
+  /** Configured ACP auth method id forwarded to `authenticate` (defaults to oauth-personal). */
+  private getAuthMethodId(): string {
+    const raw = (this.config as { auth_method?: unknown }).auth_method;
+    return typeof raw === "string" && raw.length > 0 ? raw : "oauth-personal";
   }
 
   private static extractToolCall(params: unknown): AcpToolCallShape | undefined {
@@ -386,6 +446,17 @@ export class AgyAcpAdapter implements CodingAgent {
    * `initialize -> session/new -> session/prompt` turn, or
    * `initialize -> session/resume -> session/prompt` when
    * `options.sessionId` names an existing session.
+   *
+   * Authentication is lazy, never preemptive: `session/new` (or
+   * `session/resume`) is attempted normally first. Only when it fails
+   * with the official kernel's narrow auth-required condition (JSON-RPC
+   * -32000 mentioning authentication/`authenticate`; see
+   * {@link isAcpAuthRequiredError}), one ACP `authenticate`
+   * (`{ methodId: <configured auth_method> }`) is sent and the same
+   * session call is retried exactly once with the same session id. A
+   * resume retry never invents a new session via `session/new`. Any
+   * `authenticate` or retry failure surfaces unchanged; unrelated
+   * `-32000` errors never trigger `authenticate`.
    *
    * Inbound `session/request_permission` probes (as emitted by the fake
    * kernel fixture) are answered with the real phase-1
@@ -684,13 +755,28 @@ export class AgyAcpAdapter implements CodingAgent {
       void (async () => {
         try {
           await client.initialize({ protocolVersion: 1 });
+          const authMethodId = this.getAuthMethodId();
+          const authenticateOnce = (): Promise<unknown> =>
+            client.authenticate({ methodId: authMethodId });
           let sessionId: string;
           if (resumeSessionId !== undefined) {
             // Continue path: resume the existing session. `session/new`
-            // must NOT be called here.
-            const resumed = (await client.sessionResume({
-              sessionId: resumeSessionId,
-            })) as Record<string, unknown>;
+            // must NOT be called here — including on the auth retry path.
+            const resumeOnce = (): Promise<Record<string, unknown>> =>
+              client.sessionResume({
+                sessionId: resumeSessionId,
+              }) as unknown as Promise<Record<string, unknown>>;
+            let resumed: Record<string, unknown>;
+            try {
+              resumed = await resumeOnce();
+            } catch (err) {
+              if (!isAcpAuthRequiredError(err)) throw err;
+              // One lazy authenticate, then exactly one resume retry
+              // with the same session id. Never loops; an authenticate
+              // or retry failure surfaces unchanged.
+              await authenticateOnce();
+              resumed = await resumeOnce();
+            }
             const returnedId = resumed.sessionId;
             if (
               typeof returnedId === "string" &&
@@ -705,11 +791,23 @@ export class AgyAcpAdapter implements CodingAgent {
             }
             sessionId = resumeSessionId;
           } else {
-            const created = await client.sessionNew({
-              cwd,
-              mcpServers: [],
-              ...(model ? { model } : {}),
-            });
+            const newOnce = (): Promise<Record<string, unknown>> =>
+              client.sessionNew({
+                cwd,
+                mcpServers: [],
+                ...(model ? { model } : {}),
+              }) as unknown as Promise<Record<string, unknown>>;
+            let created: Record<string, unknown>;
+            try {
+              created = await newOnce();
+            } catch (err) {
+              if (!isAcpAuthRequiredError(err)) throw err;
+              // One lazy authenticate, then exactly one session/new
+              // retry. Never preemptive, never loops; an authenticate or
+              // retry failure surfaces unchanged.
+              await authenticateOnce();
+              created = await newOnce();
+            }
             const rawSessionId = (created as Record<string, unknown>).sessionId;
             if (typeof rawSessionId !== "string" || rawSessionId.trim().length === 0) {
               throw new CodingAgentError(

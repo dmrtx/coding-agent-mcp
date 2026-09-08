@@ -6,6 +6,7 @@ import {
   DEFAULT_ACP_MAX_LINE_BYTES,
   DEFAULT_ACP_REQUEST_TIMEOUT_MS,
   isRecord,
+  type AcpAuthenticateResult,
   type AcpInitializeResult,
   type AcpSessionCancelResult,
   type AcpSessionNewResult,
@@ -399,6 +400,19 @@ export class AcpClient {
 
   public initialize(params?: Record<string, unknown>, options?: AcpRequestOptions): Promise<AcpInitializeResult> {
     return this.request<AcpInitializeResult>(AcpMethods.initialize, params, options);
+  }
+
+  /**
+   * ACP `authenticate` (ACP/T3 semantics): `params` carries
+   * `{ methodId: <configured auth_method> }`, e.g. `oauth-personal`.
+   * The kernel owns any browser OAuth/callback flow; this call simply
+   * awaits its JSON-RPC result within the request timeout.
+   */
+  public authenticate(
+    params: Record<string, unknown>,
+    options?: AcpRequestOptions
+  ): Promise<AcpAuthenticateResult> {
+    return this.request<AcpAuthenticateResult>(AcpMethods.authenticate, params, options);
   }
 
   public sessionNew(params?: Record<string, unknown>, options?: AcpRequestOptions): Promise<AcpSessionNewResult> {

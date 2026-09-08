@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Fake ACP kernel fixture for phase 1 protocol-library tests (no TaskManager
 // integration). Node stdio NDJSON responder supporting exactly:
-//   initialize, session/new, session/prompt, session/cancel, session/resume,
-//   session/set_config_option
+//   initialize, authenticate, session/new, session/prompt, session/cancel,
+//   session/resume, session/set_config_option
 // plus one inbound `session/request_permission` round-trip per prompt so
 // tests can exercise client-side permission handling at protocol level.
 //
@@ -115,6 +115,26 @@ function handleRequest(msg) {
         },
       });
       return;
+
+    case "authenticate": {
+      // Minimal official-kernel compat: accept ACP/T3 `{ methodId }` and
+      // report success. Test-only failure injection via
+      // AGY_ACP_FAKE_AUTH_FAIL=1 (surfaces as a typed request failure so
+      // the adapter must propagate it without a session retry).
+      if (process.env.AGY_ACP_FAKE_AUTH_FAIL === "1") {
+        errorTo(id, -32000, "Authentication failed: oauth browser cancelled");
+        return;
+      }
+      send({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          success: true,
+          methodId: typeof p.methodId === "string" ? p.methodId : null,
+        },
+      });
+      return;
+    }
 
     case "session/new": {
       // Load first so ids never collide with another process sharing HOME.
