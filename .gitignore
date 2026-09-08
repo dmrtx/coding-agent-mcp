@@ -5,3 +5,7 @@ dist/
 scratch/
 .coding-agent-mcp/
 coverage/
+.env
+.env.*
+!.env.example
+
