@@ -1,0 +1,43 @@
+{
+  "name": "coding-agent-mcp",
+  "version": "0.1.0",
+  "description": "Local, client-agnostic MCP server for supervising and orchestrating coding agents such as Muse and AGY.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "coding-agent-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "tsx --test test/**/*.test.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmrtx/coding-agent-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "coding-agents",
+    "orchestration",
+    "muse",
+    "agy"
+  ],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/dmrtx/coding-agent-mcp/issues"
+  },
+  "homepage": "https://github.com/dmrtx/coding-agent-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

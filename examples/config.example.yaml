@@ -1,0 +1,58 @@
+# coding-agent-mcp example configuration
+
+server:
+  # Base directory for task databases, logs, and Git worktrees
+  data_dir: ~/.coding-agent-mcp
+  # Maximum concurrent agent tasks running simultaneously
+  max_concurrent_tasks: 2
+  # Default timeout in seconds for agent tasks
+  default_task_timeout_seconds: 1800
+  # Maximum bytes retained in memory/truncated per stream
+  output_limit_bytes: 5000000
+  # Grace period in milliseconds between SIGTERM and SIGKILL
+  workspace_grace_period_ms: 3000
+
+agents:
+  muse:
+    enabled: true
+    executable: muse
+    sandbox: true
+    default_timeout_seconds: 1800
+    env_allowlist:
+      - HOME
+      - PATH
+      - TMPDIR
+      - USER
+      - SHELL
+      - LANG
+      - LC_ALL
+      - TERM
+
+  agy:
+    enabled: true
+    executable: agy
+    sandbox: true
+    default_timeout_seconds: 1800
+    env_allowlist:
+      - HOME
+      - PATH
+      - TMPDIR
+      - USER
+      - SHELL
+      - LANG
+      - LC_ALL
+      - TERM
+
+repositories:
+  my-project:
+    root: /path/to/my-project
+    writable: true
+    allow_in_place: false # in_place strategy is disabled by default for safety
+    default_workspace_strategy: worktree
+    verification_profiles:
+      test:
+        command: ["npm", "test"]
+        timeout_seconds: 900
+      lint:
+        command: ["npm", "run", "lint"]
+        timeout_seconds: 300
