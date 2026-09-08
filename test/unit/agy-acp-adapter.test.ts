@@ -163,6 +163,20 @@ test("isolated env uses per-task HOME/GEMINI_HOME under state_dir with 0700 and 
   }
 });
 
+test("isolated env forces file credential storage and ignores host override", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-file-storage-"));
+  try {
+    const adapter = new AgyAcpAdapter(makeConfig({ state_dir: stateDir }));
+    const { env, geminiHome } = adapter.buildIsolatedEnv("task_storage_1", {
+      AGY_ACP_FORCE_FILE_STORAGE: "0",
+    });
+    assert.equal(env.AGY_ACP_FORCE_FILE_STORAGE, "1");
+    assert.ok(env.GEMINI_HOME === geminiHome && geminiHome.startsWith(stateDir));
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("isolated env never copies host HOME credentials", () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-nohost-"));
   const mockHome = path.join(tmpBase, "mock-home");

@@ -309,6 +309,9 @@ export class AgyAcpAdapter implements CodingAgent {
     // Explicit overrides win over anything ambient; host HOME is never reused.
     env.HOME = homeDir;
     env.GEMINI_HOME = geminiHome;
+    // T3 Code parity: the isolated kernel always uses file credential
+    // storage; a host-provided value must never override this.
+    env.AGY_ACP_FORCE_FILE_STORAGE = "1";
     return { env, taskDir, homeDir, geminiHome };
   }
 
@@ -458,6 +461,9 @@ export class AgyAcpAdapter implements CodingAgent {
     } else {
       spawnEnv = stripCredentialEnv(options.baseEnv ?? {});
     }
+    // The spawned kernel always uses file credential storage; host values
+    // via env/baseEnv cannot override it.
+    spawnEnv.AGY_ACP_FORCE_FILE_STORAGE = "1";
     if (!spawnEnv.PATH && process.env.PATH) spawnEnv.PATH = process.env.PATH;
 
     const turnKey =
