@@ -7,12 +7,77 @@
 // tests can exercise client-side permission handling at protocol level.
 //
 // Zero dependencies; only used by tests. Not shipped (lives under test/).
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 let sessionCounter = 0;
 let permissionCounter = 9000;
 const sessions = new Map(); // sessionId -> { sessionId, cwd, model, options }
 const pendingPrompts = new Map(); // permissionRequestId -> { origId, sessionId }
+
+// Test-only cross-process session persistence for managed-continue tests.
+// A managed continue spawns a FRESH kernel process, so in-memory sessions
+// alone cannot survive across turns. Enabled solely via
+// AGY_ACP_FAKE_PERSIST=1; state lives under $HOME (the isolated task HOME
+// in managed runs), so nothing is ever written outside the fake HOME.
+const PERSIST_ENABLED = process.env.AGY_ACP_FAKE_PERSIST === "1";
+
+function persistPaths() {
+  const home = process.env.HOME;
+  if (typeof home !== "string" || home.length === 0) return null;
+  return {
+    sessions: path.join(home, ".agy-acp-fake-sessions.json"),
+    trace: path.join(home, ".agy-acp-fake-trace.jsonl"),
+  };
+}
+
+/** Append-only per-process method trace (test evidence; never protocol). */
+function traceMethod(method) {
+  if (!PERSIST_ENABLED) return;
+  try {
+    const paths = persistPaths();
+    if (!paths) return;
+    fs.appendFileSync(paths.trace, `${JSON.stringify({ pid: process.pid, method })}\n`);
+  } catch {
+    // Test-only; never break protocol handling.
+  }
+}
+
+function loadPersistedSessions() {
+  if (!PERSIST_ENABLED) return;
+  try {
+    const paths = persistPaths();
+    if (!paths || !fs.existsSync(paths.sessions)) return;
+    const data = JSON.parse(fs.readFileSync(paths.sessions, "utf-8"));
+    if (!isRecord(data)) return;
+    if (typeof data.sessionCounter === "number" && data.sessionCounter > sessionCounter) {
+      sessionCounter = data.sessionCounter;
+    }
+    if (isRecord(data.sessions)) {
+      for (const [id, entry] of Object.entries(data.sessions)) {
+        if (!sessions.has(id) && isRecord(entry)) {
+          sessions.set(id, { cwd: null, model: null, options: {}, ...entry, sessionId: id });
+        }
+      }
+    }
+  } catch {
+    // Corrupt state must never break the fake kernel.
+  }
+}
+
+function persistSessions() {
+  if (!PERSIST_ENABLED) return;
+  try {
+    const paths = persistPaths();
+    if (!paths) return;
+    const tmp = `${paths.sessions}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ sessionCounter, sessions: Object.fromEntries(sessions) }));
+    fs.renameSync(tmp, paths.sessions);
+  } catch {
+    // Test-only; never break protocol handling.
+  }
+}
 
 function send(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -29,6 +94,7 @@ function errorTo(id, code, message) {
 function handleRequest(msg) {
   const { id, method, params } = msg;
   const p = isRecord(params) ? params : {};
+  traceMethod(method);
 
   switch (method) {
     case "initialize":
@@ -43,6 +109,8 @@ function handleRequest(msg) {
       return;
 
     case "session/new": {
+      // Load first so ids never collide with another process sharing HOME.
+      loadPersistedSessions();
       sessionCounter += 1;
       const sessionId = `sess-${sessionCounter}`;
       sessions.set(sessionId, {
@@ -51,6 +119,7 @@ function handleRequest(msg) {
         model: typeof p.model === "string" ? p.model : null,
         options: {},
       });
+      persistSessions();
       send({ jsonrpc: "2.0", id, result: { sessionId } });
       return;
     }
@@ -132,6 +201,11 @@ function handleRequest(msg) {
 
     case "session/resume": {
       const sessionId = p.sessionId;
+      if (typeof sessionId === "string" && !sessions.has(sessionId)) {
+        // Cross-process resume: a previous kernel process may have persisted
+        // this session under the shared fake HOME.
+        loadPersistedSessions();
+      }
       if (typeof sessionId !== "string" || !sessions.has(sessionId)) {
         errorTo(id, -32002, `Unknown session: ${String(sessionId)}`);
         return;
