@@ -144,7 +144,9 @@ export class TaskManager {
         environment: env,
       });
 
-      if (spawnInfo.sessionId) {
+      if (workspace.strategy === "in_place") {
+        task.sessionResumable = false;
+      } else if (spawnInfo.sessionId) {
         task.sessionId = spawnInfo.sessionId;
         task.sessionResumable = true;
       }
@@ -159,7 +161,7 @@ export class TaskManager {
         details: { command: spawnInfo.command },
       });
 
-      this.processManager.spawnProcess({
+      await this.processManager.spawnProcess({
         taskId,
         command: spawnInfo.command,
         args: spawnInfo.args,
@@ -169,7 +171,7 @@ export class TaskManager {
         logPath,
         maxOutputBytes: this.config.server.output_limit_bytes,
         onOutput: (chunk: string) => {
-          if (!task!.sessionId && agent.extractSessionId) {
+          if (task!.workspaceStrategy !== "in_place" && !task!.sessionId && agent.extractSessionId) {
             const extracted = agent.extractSessionId(chunk, "");
             if (extracted) {
               task!.sessionId = extracted;
@@ -188,22 +190,26 @@ export class TaskManager {
           });
         },
         onExit: (code, signal, timedOut) => {
-          // Extract session ID from complete log if not yet captured
-          if (!task!.sessionId && agent.extractSessionId && fs.existsSync(task!.logPath)) {
-            try {
-              const fullLog = fs.readFileSync(task!.logPath, "utf-8");
-              const extracted = agent.extractSessionId(fullLog, "");
-              if (extracted) {
-                task!.sessionId = extracted;
-                task!.sessionResumable = true;
-              } else {
+          if (task!.workspaceStrategy === "in_place") {
+            task!.sessionResumable = false;
+          } else {
+            // Extract session ID from complete log if not yet captured
+            if (!task!.sessionId && agent.extractSessionId && fs.existsSync(task!.logPath)) {
+              try {
+                const fullLog = fs.readFileSync(task!.logPath, "utf-8");
+                const extracted = agent.extractSessionId(fullLog, "");
+                if (extracted) {
+                  task!.sessionId = extracted;
+                  task!.sessionResumable = true;
+                } else {
+                  task!.sessionResumable = false;
+                }
+              } catch {
                 task!.sessionResumable = false;
               }
-            } catch {
+            } else if (!task!.sessionId && params.agent === "agy") {
               task!.sessionResumable = false;
             }
-          } else if (!task!.sessionId && params.agent === "agy") {
-            task!.sessionResumable = false;
           }
           this.handleProcessExit(task!, code, signal, timedOut);
         },
@@ -257,6 +263,14 @@ export class TaskManager {
       throw new CodingAgentError(
         ErrorCodes.TASK_NOT_FOUND,
         `Task with ID '${params.task_id}' was not found`,
+        { task_id: params.task_id }
+      );
+    }
+
+    if (task.workspaceStrategy === "in_place") {
+      throw new CodingAgentError(
+        ErrorCodes.TASK_NOT_RESUMABLE,
+        `Task '${params.task_id}' used the in_place workspace strategy and cannot be resumed. in_place tasks are strictly one-shot.`,
         { task_id: params.task_id }
       );
     }
@@ -333,7 +347,7 @@ export class TaskManager {
         environment: env,
       });
 
-      this.processManager.spawnProcess({
+      await this.processManager.spawnProcess({
         taskId: task.id,
         command: spawnInfo.command,
         args: spawnInfo.args,
@@ -486,6 +500,13 @@ export class TaskManager {
     });
 
     const stopped = await this.processManager.cancelProcess(taskId);
+    if (task.workspaceStrategy === "in_place") {
+      try {
+        await this.workspaceManager.cleanupWorkspace(taskId);
+      } catch {
+        // Non-blocking cleanup
+      }
+    }
     task.status = "cancelled";
     task.finishedAt = new Date().toISOString();
     task.failure = {
@@ -506,14 +527,22 @@ export class TaskManager {
     };
   }
 
-  private handleProcessExit(
+  private async handleProcessExit(
     task: CodingTask,
     code: number | null,
     signal: string | null,
     timedOut: boolean
-  ): void {
+  ): Promise<void> {
     task.finishedAt = new Date().toISOString();
     task.exitCode = code ?? undefined;
+
+    if (task.workspaceStrategy === "in_place") {
+      try {
+        await this.workspaceManager.cleanupWorkspace(task.id);
+      } catch {
+        // Non-blocking cleanup
+      }
+    }
 
     if (timedOut) {
       task.status = "timed_out";

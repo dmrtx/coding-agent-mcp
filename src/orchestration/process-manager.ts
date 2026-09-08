@@ -41,6 +41,47 @@ export interface WorkerIdentity {
   args: string[];
   cwd: string;
   startedAt: number;
+  osStartTime?: string;
+}
+
+function getProcessStartTime(pid: number): string | null {
+  try {
+    const output = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+function getProcessCwd(pid: number): string | null {
+  try {
+    if (process.platform === "linux") {
+      return fs.readlinkSync(`/proc/${pid}/cwd`);
+    }
+    const output = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    for (const line of output.split("\n")) {
+      if (line.startsWith("n")) {
+        return line.slice(1).trim();
+      }
+    }
+  } catch {
+    // Non-blocking fallback
+  }
+  return null;
+}
+
+function canonicalizeDir(dir: string): string {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
 }
 
 export class ProcessManager {
@@ -79,7 +120,7 @@ export class ProcessManager {
     this.reservedTaskIds.delete(taskId);
   }
 
-  public spawnProcess(options: SpawnProcessOptions): number {
+  public async spawnProcess(options: SpawnProcessOptions): Promise<number> {
     fs.mkdirSync(path.dirname(options.logPath), { recursive: true });
     const logStream = fs.createWriteStream(options.logPath, { flags: "a" });
     const stdoutStream = fs.createWriteStream(`${options.logPath}.stdout`, { flags: "a" });
@@ -105,6 +146,36 @@ export class ProcessManager {
       );
     }
 
+    // Immediately attach error handler and await the spawn/error lifecycle event
+    // to catch ENOENT or other immediate spawn failures before they escape into unhandled exceptions
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onEarlyError = (err: Error) => {
+          child.removeListener("spawn", onEarlySpawn);
+          reject(err);
+        };
+        const onEarlySpawn = () => {
+          child.removeListener("error", onEarlyError);
+          resolve();
+        };
+        child.once("error", onEarlyError);
+        child.once("spawn", onEarlySpawn);
+      });
+    } catch (err: any) {
+      this.reservedTaskIds.delete(options.taskId);
+      logStream.write(`\n[coding-agent-mcp ERROR] Process spawn error: ${err.message}\n`);
+      logStream.end();
+      stdoutStream.end();
+      stderrStream.end();
+      // Guard against any future unhandled error events
+      child.on("error", () => {});
+      throw new CodingAgentError(
+        ErrorCodes.PROCESS_START_FAILED,
+        `Failed to spawn process '${options.command}': ${err.message}`,
+        { command: options.command, cwd: options.cwd, error: err.message }
+      );
+    }
+
     if (!child.pid) {
       this.reservedTaskIds.delete(options.taskId);
       logStream.end();
@@ -117,6 +188,7 @@ export class ProcessManager {
     }
 
     const pid = child.pid;
+    const osStartTime = getProcessStartTime(pid) || undefined;
 
     // Measure existing cumulative log size for per-task output capping
     let initialBytes = 0;
@@ -138,6 +210,7 @@ export class ProcessManager {
       const watchdogScript = `
         const [parentPid, childPid] = process.argv.slice(1).map(Number);
         process.stdin.resume();
+        let cleanedUp = false;
         process.stdin.on('end', cleanup);
         process.stdin.on('close', cleanup);
         process.stdin.on('error', cleanup);
@@ -146,12 +219,14 @@ export class ProcessManager {
           try { process.kill(childPid, 0); } catch { clearInterval(timer); process.exit(0); }
         }, 500);
         function cleanup() {
+          if (cleanedUp) return;
+          cleanedUp = true;
           clearInterval(timer);
           try { process.kill(-childPid, 'SIGTERM'); } catch { try { process.kill(childPid, 'SIGTERM'); } catch {} }
           setTimeout(() => {
             try { process.kill(-childPid, 'SIGKILL'); } catch { try { process.kill(childPid, 'SIGKILL'); } catch {} }
             process.exit(0);
-          }, 2000);
+          }, 2000).unref();
         }
       `;
       watchdog = spawn(process.execPath, ["-e", watchdogScript, String(process.pid), String(pid)], {
@@ -186,8 +261,9 @@ export class ProcessManager {
       pid,
       command: options.command,
       args: options.args,
-      cwd: options.cwd,
+      cwd: canonicalizeDir(options.cwd),
       startedAt: Date.now(),
+      osStartTime,
     });
 
     if (isAlreadyTruncated && options.onOutputTruncated) {
@@ -352,10 +428,32 @@ export class ProcessManager {
         continue;
       }
 
-      // 2. Verify verifiable identity: does the PID's actual command match worker?
+      // 2. Strict identity verification against recycled PIDs
+      if (worker.osStartTime) {
+        const currentStartTime = getProcessStartTime(worker.pid);
+        if (!currentStartTime || currentStartTime !== worker.osStartTime) {
+          console.error(
+            `[coding-agent-mcp] Stale PID ${worker.pid} has recycled start time (expected '${worker.osStartTime}', got '${currentStartTime}'). Skipping.`
+          );
+          continue;
+        }
+      }
+
+      if (worker.cwd) {
+        const currentCwd = getProcessCwd(worker.pid);
+        if (currentCwd && canonicalizeDir(currentCwd) !== canonicalizeDir(worker.cwd)) {
+          console.error(
+            `[coding-agent-mcp] Stale PID ${worker.pid} has recycled working directory (expected '${worker.cwd}', got '${currentCwd}'). Skipping.`
+          );
+          continue;
+        }
+      }
+
+      // 3. Verify verifiable identity: does the PID's actual command match worker?
       try {
         const cmdOutput = execFileSync("ps", ["-p", String(worker.pid), "-o", "command="], {
           encoding: "utf-8",
+          stdio: ["ignore", "pipe", "ignore"],
         }).trim();
 
         const matchesCommand =

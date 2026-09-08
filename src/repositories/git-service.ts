@@ -22,13 +22,14 @@ function execFilePromise(
         if (error) {
           // Explicitly check for buffer overflow
           if ((error as any).code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
-            reject(
-              new CodingAgentError(
-                ErrorCodes.INTERNAL_ERROR,
-                `Git output exceeded buffer limit in ${options.cwd}`,
-                { stdout: stdout ? stdout.slice(0, 1000) : "", stderr }
-              )
+            const err = new CodingAgentError(
+              ErrorCodes.INTERNAL_ERROR,
+              `Git output exceeded buffer limit in ${options.cwd}`,
+              { stdout: stdout || "", stderr, isMaxBuffer: true }
             );
+            (err as any).isMaxBuffer = true;
+            (err as any).bufferedStdout = stdout || "";
+            reject(err);
             return;
           }
 
@@ -122,7 +123,13 @@ export class GitService {
 
   public async getDiff(
     cwd: string,
-    options: { baseSha?: string; staged?: boolean; max_bytes?: number; includeUntracked?: boolean } = {}
+    options: {
+      baseSha?: string;
+      staged?: boolean;
+      max_bytes?: number;
+      includeUntracked?: boolean;
+      maxBuffer?: number;
+    } = {}
   ): Promise<GitDiffResult> {
     const maxBytes = options.max_bytes ?? 100_000;
     const filesChangedSet = new Set<string>();
@@ -138,8 +145,13 @@ export class GitService {
       args.push("--staged");
     }
 
+    let bufferOverflow = false;
+
     try {
-      const { stdout: diffOutput } = await execFilePromise("git", args, { cwd });
+      const { stdout: diffOutput } = await execFilePromise("git", args, {
+        cwd,
+        maxBuffer: options.maxBuffer,
+      });
       combinedDiff += diffOutput;
 
       const statArgs = [...args, "--numstat"];
@@ -156,7 +168,12 @@ export class GitService {
           filesChangedSet.add(parts[2]);
         }
       }
-    } catch {
+    } catch (err: any) {
+      if (err?.isMaxBuffer || err?.details?.isMaxBuffer) {
+        bufferOverflow = true;
+        const partial = err.bufferedStdout || err.details?.stdout || "";
+        combinedDiff += partial;
+      }
       // Fallback if baseSha or HEAD is empty
     }
 
@@ -221,7 +238,7 @@ export class GitService {
     }
 
     let diffText = combinedDiff;
-    let truncated = false;
+    let truncated = bufferOverflow;
     const byteLength = Buffer.byteLength(diffText, "utf-8");
 
     if (byteLength > maxBytes) {

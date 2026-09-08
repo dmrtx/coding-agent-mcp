@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { execFile } from "node:child_process";
 import {
   CodingAgent,
@@ -54,16 +57,63 @@ export class AgyAdapter implements CodingAgent {
     };
   }
 
+  private setupAgySettings(workspaceRoot: string, baseEnv: Record<string, string>): Record<string, string> {
+    try {
+      const configDir = path.join(workspaceRoot, ".gemini-config");
+      const agyCliDir = path.join(configDir, ".gemini", "antigravity-cli");
+      fs.mkdirSync(agyCliDir, { recursive: true });
+
+      const settings = {
+        enableTerminalSandbox: true,
+        toolPermission: "proceed-in-sandbox",
+        allowNonWorkspaceAccess: false,
+        trustedWorkspaces: [workspaceRoot],
+        permissions: {
+          allow: [
+            "command(git)",
+            "command(npm test)",
+            "command(npm run lint)",
+            "command(npm run build)",
+            "command(node)",
+            "command(python3)",
+            "command(pytest)",
+          ],
+        },
+      };
+
+      fs.writeFileSync(
+        path.join(agyCliDir, "settings.json"),
+        JSON.stringify(settings, null, 2),
+        "utf-8"
+      );
+
+      // Copy authentication token from host if available
+      const userHome = process.env.HOME || os.homedir();
+      const hostToken = path.join(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+      if (fs.existsSync(hostToken)) {
+        fs.copyFileSync(hostToken, path.join(agyCliDir, "antigravity-oauth-token"));
+      }
+
+      return {
+        ...baseEnv,
+        HOME: configDir,
+      };
+    } catch {
+      return baseEnv;
+    }
+  }
+
   public async prepareStart(input: AgentStartInput): Promise<AgentProcessSpawnInfo> {
     const executable = this.config.executable || "agy";
 
-    // Launch with sandbox enabled and requesting json output to capture the real conversation_id
+    // Setup strict bounded permissions configuration (no --dangerously-skip-permissions)
+    const env = this.setupAgySettings(input.workspaceRoot, input.environment);
+
     const args: string[] = [
       "--print",
       input.instruction,
       "--output-format",
       "json",
-      "--dangerously-skip-permissions",
     ];
 
     if (this.config.sandbox !== false) {
@@ -82,7 +132,7 @@ export class AgyAdapter implements CodingAgent {
       command: executable,
       args,
       cwd: input.workspaceRoot,
-      env: input.environment,
+      env,
       sessionId: undefined, // Will be extracted from real JSON output after run
     };
   }
@@ -97,6 +147,8 @@ export class AgyAdapter implements CodingAgent {
 
     const executable = this.config.executable || "agy";
 
+    const env = this.setupAgySettings(input.workspaceRoot, input.environment);
+
     const args: string[] = [
       "--print",
       input.instruction,
@@ -104,7 +156,6 @@ export class AgyAdapter implements CodingAgent {
       "json",
       "--conversation",
       input.sessionId,
-      "--dangerously-skip-permissions",
     ];
 
     if (this.config.sandbox !== false) {
@@ -123,7 +174,7 @@ export class AgyAdapter implements CodingAgent {
       command: executable,
       args,
       cwd: input.workspaceRoot,
-      env: input.environment,
+      env,
       sessionId: input.sessionId,
     };
   }

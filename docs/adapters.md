@@ -32,19 +32,25 @@
 - The adapter checks `agents.agy.executable` (defaults to `agy`).
 - Version detection runs `agy --version`.
 
-### Headless Execution
+### Headless Execution & Containment
 - When `start_task` is invoked:
-  `agy --print "<instruction>" --output-format json --sandbox --dangerously-skip-permissions`
+  `agy --print "<instruction>" --output-format json --sandbox`
   (executed with working directory set to the task workspace).
 - Notice:
-  - `--sandbox` is explicitly enabled to enforce terminal execution restrictions.
-  - `--dangerously-skip-permissions` is required in headless print mode so that tool calls proceed without interactive stdin confirmation prompts.
+  - `--dangerously-skip-permissions` is strictly **omitted**.
+  - Instead, the adapter sets up an isolated environment with `HOME` pointing to `<workspaceRoot>/.gemini-config` containing `.gemini/antigravity-cli/settings.json`:
+    - `enableTerminalSandbox: true`
+    - `toolPermission: "proceed-in-sandbox"` (auto-proceeds within the sandbox)
+    - `allowNonWorkspaceAccess: false` (strictly blocks reading or writing outside the workspace)
+    - `trustedWorkspaces: [<workspaceRoot>]`
+    - Granular permissions allowlist for safe build and test commands (`git`, `npm test`, `npm run lint`, etc.).
+  - `--sandbox` is explicitly enabled.
   - `--output-format json` emits structured output from which the real `conversation_id` is parsed and stored.
   - If `mode` is `review` or `investigate`, `--mode plan` is added.
 
 ### Continuation & Session Resumption
 - When `continue_task` is called:
-  `agy --print "<instruction>" --output-format json --sandbox --dangerously-skip-permissions --conversation <conversationId>`
+  `agy --print "<instruction>" --output-format json --sandbox --conversation <conversationId>`
 - **Strict session resumption**: `sessionId` is strictly required. If no conversation ID was captured from the initial execution, the task cannot be continued and is rejected with `TASK_NOT_RESUMABLE`. Global fallback `--continue` is never used.
 - In `review` and `investigate` modes, `--mode plan` is preserved in continuation calls.
 

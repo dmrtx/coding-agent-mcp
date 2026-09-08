@@ -306,3 +306,27 @@ test("GitService handles large diffs >1 MiB without silent truncation or maxBuff
   fs.rmSync(repoDir, { recursive: true, force: true });
 });
 
+test("GitService reports truncated: true with buffered output on buffer overflow instead of silently swallowing as empty diff", async () => {
+  const { repoDir, baseSha } = setupTestGitRepo();
+  const gitService = new GitService();
+
+  // Create tracked changes
+  const content = "const chunk = 'abcdefghijklmnopqrstuvwxyz0123456789\\n';\n".repeat(400);
+  fs.writeFileSync(path.join(repoDir, "file1.txt"), content);
+
+  // Invoke getDiff with small maxBuffer = 1024 (1 KiB)
+  const diffResult = await gitService.getDiff(repoDir, {
+    baseSha,
+    maxBuffer: 1024,
+    max_bytes: 100_000,
+    includeUntracked: false,
+  });
+
+  // Must report truncated: true and contain buffered output (NOT empty diff)
+  assert.equal(diffResult.truncated, true, "Buffer overflow must mark diff as truncated");
+  assert.ok(diffResult.diff.length > 0, "Buffered output must NOT be swallowed or empty");
+  assert.ok(diffResult.diff.includes("file1.txt") || diffResult.diff.includes("diff --git"));
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+});
+

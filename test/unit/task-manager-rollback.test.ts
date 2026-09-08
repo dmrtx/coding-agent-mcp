@@ -38,6 +38,63 @@ class FailingAgent implements CodingAgent {
   }
 }
 
+class MissingBinaryAgent implements CodingAgent {
+  public readonly id = "missing-binary-agent";
+  public readonly displayName = "Missing Binary Agent";
+
+  async describe(): Promise<AgentDescriptor> {
+    return {
+      id: this.id,
+      displayName: this.displayName,
+      available: true,
+      capabilities: ["modify_files"],
+    };
+  }
+
+  async prepareStart(input: AgentStartInput): Promise<AgentProcessSpawnInfo> {
+    return {
+      command: "/definitely/missing/binary",
+      args: ["--param"],
+      cwd: input.workspaceRoot,
+      env: input.environment,
+    };
+  }
+}
+
+class QuickInPlaceAgent implements CodingAgent {
+  public readonly id = "quick-inplace-agent";
+  public readonly displayName = "Quick In-Place Agent";
+
+  async describe(): Promise<AgentDescriptor> {
+    return {
+      id: this.id,
+      displayName: this.displayName,
+      available: true,
+      capabilities: ["modify_files"],
+    };
+  }
+
+  async prepareStart(input: AgentStartInput): Promise<AgentProcessSpawnInfo> {
+    return {
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: input.workspaceRoot,
+      env: input.environment,
+      sessionId: "session-quick-1",
+    };
+  }
+
+  async prepareContinue(input: any): Promise<AgentProcessSpawnInfo> {
+    return {
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: input.workspaceRoot,
+      env: input.environment,
+      sessionId: input.sessionId,
+    };
+  }
+}
+
 function setupRollbackEnvironment() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tm-rollback-test-"));
   const repoDir = path.join(tmpDir, "repo");
@@ -94,9 +151,14 @@ function setupRollbackEnvironment() {
 
   return {
     tmpDir,
+    repoDir,
     dataDir,
     taskManager,
     taskStore,
+    processManager,
+    workspaceManager,
+    repoRegistry,
+    agentRegistry,
     cleanup: () => {
       taskStore.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -175,6 +237,92 @@ test("TaskManager rolls back task state and followUpInstructions when continueTa
     assert.equal(restored.status, "completed");
     assert.equal(restored.exitCode, 0);
     assert.equal(restored.followUpInstructions.length, 0);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("TaskManager handles ENOENT for missing binary cleanly without unhandled error or server crash", async () => {
+  const env = setupRollbackEnvironment();
+  env.agentRegistry.registerAgent(new MissingBinaryAgent());
+
+  try {
+    await assert.rejects(
+      () =>
+        env.taskManager.startTask({
+          repository: "test-repo",
+          agent: "missing-binary-agent",
+          instruction: "try run missing binary",
+        }),
+      (err: any) => err.code === "PROCESS_START_FAILED"
+    );
+
+    // Concurrency slot must be cleanly released
+    assert.equal(env.processManager.getRunningProcessCount(), 0);
+
+    // Workspace worktree directory must be cleaned up
+    const workspacesDir = path.join(env.dataDir, "workspaces");
+    if (fs.existsSync(workspacesDir)) {
+      const items = fs.readdirSync(workspacesDir);
+      assert.equal(items.length, 0, "Failed workspace must be cleaned up on missing binary");
+    }
+
+    // Task must be recorded as failed with PROCESS_START_FAILED
+    const tasks = env.taskStore.listTasks();
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0].status, "failed");
+    assert.equal(tasks[0].failure?.code, "PROCESS_START_FAILED");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("TaskManager enforces in_place one-shot non-resumable policy and releases lock upon exit", async () => {
+  const env = setupRollbackEnvironment();
+  // Enable allow_in_place on test-repo
+  const repoConfig = env.repoRegistry.getRepository("test-repo");
+  (repoConfig as any).allow_in_place = true;
+  env.agentRegistry.registerAgent(new QuickInPlaceAgent());
+
+  try {
+    const started = await env.taskManager.startTask({
+      repository: "test-repo",
+      agent: "quick-inplace-agent",
+      instruction: "run in place",
+      workspace_strategy: "in_place",
+    });
+
+    const task = env.taskStore.getTask(started.task_id)!;
+    // Must be marked non-resumable
+    assert.equal(task.sessionResumable, false, "in_place tasks must not be resumable");
+
+    // Wait for task process to finish
+    await new Promise((r) => setTimeout(r, 400));
+    const completedTask = env.taskStore.getTask(started.task_id)!;
+    assert.equal(completedTask.status, "completed");
+
+    // continueTask must be strictly rejected
+    await assert.rejects(
+      () =>
+        env.taskManager.continueTask({
+          task_id: started.task_id,
+          instruction: "continue in place",
+        }),
+      (err: any) => err.code === "TASK_NOT_RESUMABLE"
+    );
+
+    // Lock must have been released upon task completion, allowing a second in_place task!
+    const secondStarted = await env.taskManager.startTask({
+      repository: "test-repo",
+      agent: "quick-inplace-agent",
+      instruction: "second in place task",
+      workspace_strategy: "in_place",
+    });
+    assert.ok(secondStarted.task_id);
+
+    await new Promise((r) => setTimeout(r, 400));
+    const secondTask = env.taskStore.getTask(secondStarted.task_id)!;
+    assert.equal(secondTask.status, "completed");
   } finally {
     env.cleanup();
   }

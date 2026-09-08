@@ -21,7 +21,7 @@ All operations are constrained through semantic tools:
 
 Worker agents must never run with unconstrained system access.
 - **Muse**: Executed with `--trust-workspace --disable-approval --approval-mode never` for non-interactive execution, but **without** `--yolo`, keeping Meta's shell/filesystem sandboxing active.
-- **AGY**: Executed with `--sandbox --dangerously-skip-permissions`. In headless print mode, `--sandbox` enforces terminal execution restrictions, while environment sanitization prevents credential exfiltration.
+- **AGY**: Executed with `--sandbox` and an isolated task configuration directory without `--dangerously-skip-permissions`. The isolated configuration sets `enableTerminalSandbox: true`, `toolPermission: "proceed-in-sandbox"`, `allowNonWorkspaceAccess: false`, and granular tool allowlists, ensuring worker actions cannot escape outside the assigned workspace.
 - **Review/Investigate Modes**: Enforce read-only semantics (`--disable-write` and `--disable-shell` on Muse, `--mode plan` on AGY).
 
 ---
@@ -47,18 +47,19 @@ Child agent and verification processes do not inherit the entire host environmen
 
 - **Worktree Isolation**: Tasks default to Git worktrees under `~/.coding-agent-mcp/workspaces/<task-id>` on dedicated `agent/<task-id>` branches.
 - **in_place Restrictions**: `in_place` workspace strategy is disabled by default (`allow_in_place: false`). If explicitly enabled, `in_place` tasks are rejected if the working tree has uncommitted or untracked changes (`WORKSPACE_CONFLICT`).
-- **Atomic Locking**: `in_place` mutual exclusion locks are acquired synchronously before any asynchronous checks, eliminating race conditions between concurrent requests.
+- **Atomic Locking & Lifecycle**: `in_place` mutual exclusion locks are acquired synchronously before any asynchronous checks, eliminating race conditions between concurrent requests. `in_place` tasks are strictly one-shot and non-resumable (`sessionResumable: false`, rejection in `continueTask`). Upon process termination, exit, cancellation, or failure, the repository lock is promptly released via `cleanupWorkspace()`.
 
 ---
 
 ## 6. Process Lifecycle & Crash Orphan Prevention
 
 - **Detached Process Groups**: Subprocesses run in detached process groups so signals propagate cleanly to all children (compilers, shell tools, scripts).
-- **Inline Guardian Watchdog**: Each worker process has an attached guardian watchdog connected via an OS pipe. If the MCP server dies abruptly (via `SIGKILL`, kernel crash, or power failure), the OS kernel closes the pipe descriptor and the watchdog terminates the child process group within milliseconds, guaranteeing workers are not left orphaned.
-- **Verifiable Process Identity Recovery**: Active worker metadata (PID, exact command line, working directory, and start timestamp) is recorded on disk. On server startup, `recoverOrphanedWorkers()` inspects running processes via `ps` to verify identity before signaling, preventing blind PID reuse hazards.
+- **Inline Guardian Watchdog**: Each worker process has an attached guardian watchdog connected via an OS pipe. If the MCP server dies abruptly (via `SIGKILL`, kernel crash, or power failure), the OS kernel closes the pipe descriptor and the watchdog terminates the child process group within milliseconds, guaranteeing workers are not left orphaned. Watchdog cleanup is strictly idempotent.
+- **Verifiable Process Identity Recovery**: Active worker metadata (PID, exact command line, canonical working directory, and OS start timestamp from `ps -p <pid> -o lstart=`) is recorded on disk. On server startup, `recoverOrphanedWorkers()` verifies exact OS start time and working directory before signaling, ensuring recycled PIDs running the same binary are never killed.
+- **Immediate Spawn Error Handling**: `spawnProcess` asynchronously awaits initial process spawn and error events, capturing `ENOENT` / missing binary errors cleanly without unhandled exceptions.
 - **Graceful Shutdown**: Server termination (`SIGINT`, `SIGTERM`) triggers `ProcessManager.shutdown()` terminating all active child process groups.
 - **Atomic Concurrency Reservations**: `max_concurrent_tasks` slots are reserved synchronously before any asynchronous operations, preventing concurrency races.
-- **Cumulative Output Cap**: Output limits are enforced cumulatively across all continuation turns of a task, strictly capping the single task log size.
+- **Cumulative Output Cap & Git Buffer Overflow**: Output limits are enforced cumulatively across all continuation turns of a task, strictly capping the single task log size. Git diff operations catch buffer overflow, preserving buffered diff output with `truncated: true`.
 
 ---
 

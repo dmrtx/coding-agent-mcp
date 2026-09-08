@@ -13,7 +13,7 @@ test("ProcessManager shutdown terminates all active worker process groups", asyn
   const log1 = path.join(tmpDir, "task1.log");
   const log2 = path.join(tmpDir, "task2.log");
 
-  pm.spawnProcess({
+  await pm.spawnProcess({
     taskId: "task-1",
     command: process.execPath,
     args: ["-e", "setTimeout(() => {}, 60000)"],
@@ -23,7 +23,7 @@ test("ProcessManager shutdown terminates all active worker process groups", asyn
     logPath: log1,
   });
 
-  pm.spawnProcess({
+  await pm.spawnProcess({
     taskId: "task-2",
     command: process.execPath,
     args: ["-e", "setTimeout(() => {}, 60000)"],
@@ -51,7 +51,7 @@ test("ProcessManager cleans up timers and doesn't fire forceKill on early exit",
   const log = path.join(tmpDir, "task.log");
 
   let exited = false;
-  pm.spawnProcess({
+  await pm.spawnProcess({
     taskId: "task-fast",
     command: process.execPath,
     args: ["-e", "setTimeout(() => process.exit(0), 100)"],
@@ -80,7 +80,7 @@ test("ProcessManager bounds output and writes separate stdout/stderr files", asy
   const log = path.join(tmpDir, "task-output.log");
 
   let truncated = false;
-  pm.spawnProcess({
+  await pm.spawnProcess({
     taskId: "task-out",
     command: process.execPath,
     args: [
@@ -145,7 +145,7 @@ test("ProcessManager enforces cumulative per-task output cap across continuation
   const log = path.join(tmpDir, "task-cum.log");
 
   // First run: writes 60 bytes (limit 100)
-  pm.spawnProcess({
+  await pm.spawnProcess({
     taskId: "task-cum",
     command: process.execPath,
     args: ["-e", "process.stdout.write('A'.repeat(60));"],
@@ -161,7 +161,7 @@ test("ProcessManager enforces cumulative per-task output cap across continuation
 
   // Second run (continuation on same task log): writes another 60 bytes
   let continuationTruncated = false;
-  pm.spawnProcess({
+  await pm.spawnProcess({
     taskId: "task-cum",
     command: process.execPath,
     args: ["-e", "process.stdout.write('B'.repeat(60));"],
@@ -221,6 +221,148 @@ test("ProcessManager safely recovers verifiable orphaned workers on startup", as
     alive = false;
   }
   assert.equal(alive, false, "Orphaned worker must be terminated");
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("ProcessManager does NOT kill recycled PID with same binary but different start time or cwd", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-recycled-test-"));
+  const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-other-dir-"));
+  const pm = new ProcessManager(1000, tmpDir);
+
+  // Spawn an innocent process (node) running in otherDir
+  const innocent = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    cwd: otherDir,
+    detached: true,
+    stdio: "ignore",
+  });
+  const innocentPid = innocent.pid!;
+
+  try {
+    // Write stale identity claiming this PID belonged to a different task with different start time and cwd
+    const identityFile = path.join(tmpDir, "active-workers.json");
+    fs.writeFileSync(
+      identityFile,
+      JSON.stringify([
+        {
+          taskId: "task-stale-recycled",
+          pid: innocentPid,
+          command: process.execPath,
+          args: ["-e", "setInterval(() => {}, 1000);"],
+          cwd: tmpDir, // Different cwd!
+          startedAt: Date.now() - 1000000,
+          osStartTime: "Mon Jan  1 00:00:00 2020", // Different start time!
+        },
+      ])
+    );
+
+    // Startup recovery must NOT touch the innocent recycled PID
+    const recovered = await pm.recoverOrphanedWorkers();
+    assert.equal(recovered, 0, "Recycled PID must not be recovered or terminated");
+
+    // Verify innocent process is STILL alive
+    let alive = true;
+    try {
+      process.kill(innocentPid, 0);
+    } catch {
+      alive = false;
+    }
+    assert.equal(alive, true, "Innocent process must still be running");
+  } finally {
+    try {
+      process.kill(-innocentPid, "SIGKILL");
+    } catch {
+      try {
+        process.kill(innocentPid, "SIGKILL");
+      } catch {}
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(otherDir, { recursive: true, force: true });
+  }
+});
+
+test("Inline watchdog terminates worker process when parent server is abruptly killed with SIGKILL", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-watchdog-test-"));
+  const tsxCli = path.resolve("node_modules/tsx/dist/cli.mjs");
+  const parentScript = path.join(tmpDir, "parent.ts");
+  const readyFile = path.join(tmpDir, "ready.json");
+
+  fs.writeFileSync(
+    parentScript,
+    `
+    import { ProcessManager } from ${JSON.stringify(path.resolve("src/orchestration/process-manager.ts"))};
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const pm = new ProcessManager(500, ${JSON.stringify(tmpDir)});
+    async function run() {
+      const pid = await pm.spawnProcess({
+        taskId: "task-watchdog-target",
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000);"],
+        cwd: ${JSON.stringify(tmpDir)},
+        env: {},
+        timeoutMs: 60000,
+        logPath: path.join(${JSON.stringify(tmpDir)}, "target.log"),
+      });
+      fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ parentPid: process.pid, workerPid: pid }));
+    }
+    run();
+    `
+  );
+
+  spawn(process.execPath, [tsxCli, parentScript], {
+    cwd: tmpDir,
+    stdio: "ignore",
+  });
+
+  // Wait for worker PID file to be written
+  let parentPid: number | null = null;
+  let workerPid: number | null = null;
+  for (let i = 0; i < 50; i++) {
+    if (fs.existsSync(readyFile)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(readyFile, "utf-8"));
+        if (data.parentPid && data.workerPid) {
+          parentPid = Number(data.parentPid);
+          workerPid = Number(data.workerPid);
+          break;
+        }
+      } catch {
+        // Retry
+      }
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  assert.ok(parentPid, "Parent PID should have been reported");
+  assert.ok(workerPid, "Worker PID should have been reported");
+
+  // Verify worker is alive initially
+  let workerAliveBefore = true;
+  try {
+    process.kill(workerPid, 0);
+  } catch {
+    workerAliveBefore = false;
+  }
+  assert.equal(workerAliveBefore, true, "Worker must be running initially");
+
+  // Abruptly kill the parent process with SIGKILL (simulating hard crash)
+  process.kill(parentPid, "SIGKILL");
+
+  // Wait up to 4 seconds for inline watchdog to detect parent termination and kill the worker
+  let workerAliveAfter = true;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    try {
+      process.kill(workerPid, 0);
+    } catch {
+      workerAliveAfter = false;
+      break;
+    }
+  }
+
+  assert.equal(workerAliveAfter, false, "Watchdog must terminate worker when parent is killed with SIGKILL");
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
