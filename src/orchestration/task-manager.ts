@@ -70,27 +70,23 @@ export class TaskManager {
     agent: string;
     repository: string;
   }> {
-    const repoConfig = this.repoRegistry.getRepository(params.repository);
-
-    // Validate agent availability BEFORE doing any workspace or task operations
-    const agent = await this.agentRegistry.validateAgentAvailable(params.agent);
-
-    const activeCount = this.processManager.getRunningProcessCount();
-    if (activeCount >= this.config.server.max_concurrent_tasks) {
-      throw new CodingAgentError(
-        ErrorCodes.CONCURRENCY_LIMIT_REACHED,
-        `Maximum concurrent tasks (${this.config.server.max_concurrent_tasks}) reached. Wait for an active task to finish.`
-      );
-    }
-
     const taskId = `task_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
-    const mode = params.mode ?? "implement";
-    const workspaceStrategy = params.workspace_strategy ?? repoConfig.default_workspace_strategy;
+
+    // Atomically reserve concurrency slot BEFORE any await to prevent race conditions
+    this.processManager.reserveSlot(taskId, this.config.server.max_concurrent_tasks);
 
     let workspace: WorkspaceDescriptor | undefined;
     let task: CodingTask | undefined;
 
     try {
+      const repoConfig = this.repoRegistry.getRepository(params.repository);
+
+      // Validate agent availability
+      const agent = await this.agentRegistry.validateAgentAvailable(params.agent);
+
+      const mode = params.mode ?? "implement";
+      const workspaceStrategy = params.workspace_strategy ?? repoConfig.default_workspace_strategy;
+
       workspace = await this.workspaceManager.createWorkspace(
         taskId,
         params.repository,
@@ -226,6 +222,8 @@ export class TaskManager {
         repository: params.repository,
       };
     } catch (err) {
+      this.processManager.releaseSlot(taskId);
+
       // Rollback on startup or spawn failure
       if (workspace) {
         try {
@@ -263,21 +261,11 @@ export class TaskManager {
       );
     }
 
-    if (this.processManager.isProcessRunning(task.id)) {
-      throw new CodingAgentError(
-        ErrorCodes.TASK_NOT_RUNNING,
-        `Task '${params.task_id}' is currently running; wait for completion before continuing`,
-        { task_id: params.task_id }
-      );
-    }
-
-    // Validate agent availability
-    const agent = await this.agentRegistry.validateAgentAvailable(task.agentId);
-    if (!agent.prepareContinue) {
+    if (task.status !== "completed") {
       throw new CodingAgentError(
         ErrorCodes.TASK_NOT_RESUMABLE,
-        `Agent '${task.agentId}' does not support task continuation`,
-        { agent: task.agentId }
+        `Task '${params.task_id}' has status '${task.status}' and cannot be continued. Only completed tasks are resumable.`,
+        { task_id: params.task_id, status: task.status }
       );
     }
 
@@ -289,13 +277,8 @@ export class TaskManager {
       );
     }
 
-    const activeCount = this.processManager.getRunningProcessCount();
-    if (activeCount >= this.config.server.max_concurrent_tasks) {
-      throw new CodingAgentError(
-        ErrorCodes.CONCURRENCY_LIMIT_REACHED,
-        `Maximum concurrent tasks (${this.config.server.max_concurrent_tasks}) reached.`
-      );
-    }
+    // Atomically reserve concurrency slot BEFORE any await to prevent race conditions
+    this.processManager.reserveSlot(task.id, this.config.server.max_concurrent_tasks);
 
     const previousStatus = task.status;
     const previousStartedAt = task.startedAt;
@@ -310,6 +293,15 @@ export class TaskManager {
     };
 
     try {
+      // Validate agent availability
+      const agent = await this.agentRegistry.validateAgentAvailable(task.agentId);
+      if (!agent.prepareContinue) {
+        throw new CodingAgentError(
+          ErrorCodes.TASK_NOT_RESUMABLE,
+          `Agent '${task.agentId}' does not support task continuation`,
+          { agent: task.agentId }
+        );
+      }
       task.followUpInstructions.push(followUp);
       task.status = "running";
       task.startedAt = new Date().toISOString();
@@ -390,6 +382,8 @@ export class TaskManager {
         instruction: params.instruction,
       };
     } catch (err) {
+      this.processManager.releaseSlot(task.id);
+
       // Complete rollback on continue failure: remove the unexecuted instruction and restore previous timestamps/status
       task.followUpInstructions.pop();
       task.startedAt = previousStartedAt;

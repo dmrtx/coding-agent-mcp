@@ -78,33 +78,39 @@ export class WorkspaceManager {
         );
       }
 
-      // Check clean working tree before granting in_place access
-      const status = await this.gitService.getStatus(repoConfig.root);
-      if (!status.clean) {
-        throw new CodingAgentError(
-          ErrorCodes.WORKSPACE_CONFLICT,
-          `Repository '${repositoryId}' has uncommitted changes or untracked files. in_place strategy requires a clean working tree.`,
-          { repository: repositoryId, files: status.files }
-        );
-      }
-
+      // Synchronously acquire lock BEFORE any async operations to eliminate race conditions
       this.inPlaceLocks.add(repositoryId);
 
-      const baseSha = await this.gitService.getHeadSha(repoConfig.root);
+      try {
+        // Check clean working tree before granting in_place access
+        const status = await this.gitService.getStatus(repoConfig.root);
+        if (!status.clean) {
+          throw new CodingAgentError(
+            ErrorCodes.WORKSPACE_CONFLICT,
+            `Repository '${repositoryId}' has uncommitted changes or untracked files. in_place strategy requires a clean working tree.`,
+            { repository: repositoryId, files: status.files }
+          );
+        }
 
-      const descriptor: WorkspaceDescriptor = {
-        taskId,
-        repositoryId,
-        strategy: "in_place",
-        workspaceRoot: repoConfig.root,
-        repositoryRoot: repoConfig.root,
-        baseSha,
-        headSha: baseSha,
-        cleaned: false,
-      };
+        const baseSha = await this.gitService.getHeadSha(repoConfig.root);
 
-      this.activeWorkspaces.set(taskId, descriptor);
-      return descriptor;
+        const descriptor: WorkspaceDescriptor = {
+          taskId,
+          repositoryId,
+          strategy: "in_place",
+          workspaceRoot: repoConfig.root,
+          repositoryRoot: repoConfig.root,
+          baseSha,
+          headSha: baseSha,
+          cleaned: false,
+        };
+
+        this.activeWorkspaces.set(taskId, descriptor);
+        return descriptor;
+      } catch (err) {
+        this.inPlaceLocks.delete(repositoryId);
+        throw err;
+      }
     }
 
     // Worktree strategy

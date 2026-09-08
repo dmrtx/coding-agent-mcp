@@ -236,3 +236,73 @@ test("WorkspaceManager.pruneOldWorktrees removes stale worktrees and deletes git
   fs.rmSync(repoDir, { recursive: true, force: true });
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
+
+test("WorkspaceManager atomically locks in_place strategy against concurrent requests", async () => {
+  const { repoDir } = setupTestGitRepo();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wm-inplace-race-"));
+  const gitService = new GitService();
+  const wm = new WorkspaceManager(dataDir, gitService);
+
+  const repoConfig: RepositoryConfig = {
+    root: repoDir,
+    writable: true,
+    allow_in_place: true,
+    default_workspace_strategy: "in_place",
+    verification_profiles: {},
+  };
+
+  // Launch two concurrent in_place workspace requests simultaneously
+  const results = await Promise.allSettled([
+    wm.createWorkspace("task-race-1", "test-repo", repoConfig, "in_place"),
+    wm.createWorkspace("task-race-2", "test-repo", repoConfig, "in_place"),
+  ]);
+
+  const fulfilled = results.filter((r) => r.status === "fulfilled");
+  const rejected = results.filter((r) => r.status === "rejected");
+
+  assert.equal(fulfilled.length, 1, "Exactly one in_place workspace must be acquired");
+  assert.equal(rejected.length, 1, "Concurrent in_place workspace request must be rejected");
+
+  const rejectionReason = (rejected[0] as PromiseRejectedResult).reason;
+  assert.equal(rejectionReason.code, "WORKSPACE_CONFLICT");
+
+  // Cleanup the successful one
+  const successfulTaskId = (fulfilled[0] as PromiseFulfilledResult<any>).value.taskId;
+  await wm.cleanupWorkspace(successfulTaskId);
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("GitService handles large diffs >1 MiB without silent truncation or maxBuffer errors", async () => {
+  const { repoDir, baseSha } = setupTestGitRepo();
+  const gitService = new GitService();
+
+  // Create a 1.2 MiB file commit
+  const largeContent = "const chunk = 'abcdefghijklmnopqrstuvwxyz0123456789\\n';\n".repeat(25000); // ~1.3 MB
+  fs.writeFileSync(path.join(repoDir, "large_file.js"), largeContent);
+
+  // 1. Check full diff with large max_bytes
+  const fullDiff = await gitService.getDiff(repoDir, {
+    baseSha,
+    max_bytes: 10 * 1024 * 1024,
+    includeUntracked: true,
+  });
+
+  assert.equal(fullDiff.truncated, false, "1.2 MB diff must not be truncated when max_bytes is 10 MB");
+  assert.ok(fullDiff.diff.length > 1024 * 1024, "Diff output must exceed 1 MiB");
+  assert.ok(fullDiff.files_changed.includes("large_file.js"));
+
+  // 2. Check explicit truncation when max_bytes is small
+  const truncatedDiff = await gitService.getDiff(repoDir, {
+    baseSha,
+    max_bytes: 50_000,
+    includeUntracked: true,
+  });
+
+  assert.equal(truncatedDiff.truncated, true);
+  assert.equal(Buffer.byteLength(truncatedDiff.diff, "utf-8"), 50_000);
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+});
+

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn } from "node:child_process";
 import { ProcessManager } from "../../src/orchestration/process-manager.js";
 
 test("ProcessManager shutdown terminates all active worker process groups", async () => {
@@ -84,7 +85,7 @@ test("ProcessManager bounds output and writes separate stdout/stderr files", asy
     command: process.execPath,
     args: [
       "-e",
-      "console.log('stdout message'); console.error('stderr message'); console.log('X'.repeat(500));",
+      "console.log('stdout message'); console.error('stderr message'); setTimeout(() => console.log('X'.repeat(500)), 50);",
     ],
     cwd: tmpDir,
     env: {},
@@ -113,3 +114,114 @@ test("ProcessManager bounds output and writes separate stdout/stderr files", asy
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+test("ProcessManager reserves and releases concurrency slots atomically", () => {
+  const pm = new ProcessManager(1000);
+
+  // Reserve slot 1 with limit 2
+  pm.reserveSlot("task-1", 2);
+  assert.equal(pm.getRunningProcessCount(), 1);
+
+  // Reserve slot 2 with limit 2
+  pm.reserveSlot("task-2", 2);
+  assert.equal(pm.getRunningProcessCount(), 2);
+
+  // Third reservation must fail with CONCURRENCY_LIMIT_REACHED
+  assert.throws(
+    () => pm.reserveSlot("task-3", 2),
+    (err: any) => err.code === "CONCURRENCY_LIMIT_REACHED"
+  );
+
+  // Releasing a slot allows new reservation
+  pm.releaseSlot("task-1");
+  assert.equal(pm.getRunningProcessCount(), 1);
+  pm.reserveSlot("task-3", 2);
+  assert.equal(pm.getRunningProcessCount(), 2);
+});
+
+test("ProcessManager enforces cumulative per-task output cap across continuations", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-cum-output-"));
+  const pm = new ProcessManager(1000);
+  const log = path.join(tmpDir, "task-cum.log");
+
+  // First run: writes 60 bytes (limit 100)
+  pm.spawnProcess({
+    taskId: "task-cum",
+    command: process.execPath,
+    args: ["-e", "process.stdout.write('A'.repeat(60));"],
+    cwd: tmpDir,
+    env: {},
+    timeoutMs: 5000,
+    logPath: log,
+    maxOutputBytes: 100,
+  });
+
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(fs.statSync(log).size >= 60, true);
+
+  // Second run (continuation on same task log): writes another 60 bytes
+  let continuationTruncated = false;
+  pm.spawnProcess({
+    taskId: "task-cum",
+    command: process.execPath,
+    args: ["-e", "process.stdout.write('B'.repeat(60));"],
+    cwd: tmpDir,
+    env: {},
+    timeoutMs: 5000,
+    logPath: log,
+    maxOutputBytes: 100,
+    onOutputTruncated: () => {
+      continuationTruncated = true;
+    },
+  });
+
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(continuationTruncated, true, "Continuation must trigger output truncation when task cumulative limit is reached");
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("ProcessManager safely recovers verifiable orphaned workers on startup", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-recovery-test-"));
+  const pm = new ProcessManager(1000, tmpDir);
+
+  // Spawn a real long-running worker process
+  const worker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+    cwd: tmpDir,
+    detached: true,
+    stdio: "ignore",
+  });
+  const workerPid = worker.pid!;
+
+  // Write verifiable identity as if left behind by a hard crash
+  const identityFile = path.join(tmpDir, "active-workers.json");
+  fs.writeFileSync(
+    identityFile,
+    JSON.stringify([
+      {
+        taskId: "task-orphaned-1",
+        pid: workerPid,
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => {}, 60000)"],
+        cwd: tmpDir,
+        startedAt: Date.now(),
+      },
+    ])
+  );
+
+  // Startup recovery
+  const recovered = await pm.recoverOrphanedWorkers();
+  assert.equal(recovered, 1);
+
+  // Verify worker is dead
+  let alive = true;
+  try {
+    process.kill(workerPid, 0);
+  } catch {
+    alive = false;
+  }
+  assert.equal(alive, false, "Orphaned worker must be terminated");
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+

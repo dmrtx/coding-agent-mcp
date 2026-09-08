@@ -171,3 +171,44 @@ test("TaskManager cancels a long running task", async () => {
     env.cleanup();
   }
 });
+
+test("TaskManager atomically enforces max_concurrent_tasks under simultaneous startTask requests", async () => {
+  const env = setupTestEnv();
+  // Override max_concurrent_tasks to 1
+  (env.taskManager as any).config.server.max_concurrent_tasks = 1;
+
+  try {
+    const results = await Promise.allSettled([
+      env.taskManager.startTask({
+        repository: "sample-repo",
+        agent: "fake-agent",
+        instruction: "simultaneous task 1",
+      }),
+      env.taskManager.startTask({
+        repository: "sample-repo",
+        agent: "fake-agent",
+        instruction: "simultaneous task 2",
+      }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+
+    assert.equal(fulfilled.length, 1, "Exactly one task must be granted concurrency slot when limit is 1");
+    assert.equal(rejected.length, 1, "Concurrent task must be rejected");
+
+    const rejectionReason = (rejected[0] as PromiseRejectedResult).reason;
+    assert.equal(rejectionReason.code, "CONCURRENCY_LIMIT_REACHED");
+
+    // Wait for the running one to finish
+    const successfulTaskId = (fulfilled[0] as PromiseFulfilledResult<any>).value.task_id;
+    let task = env.taskManager.getTask(successfulTaskId);
+    while (task.status === "running" || task.status === "starting") {
+      await new Promise((r) => setTimeout(r, 100));
+      task = env.taskManager.getTask(successfulTaskId);
+    }
+  } finally {
+    env.cleanup();
+  }
+});
+

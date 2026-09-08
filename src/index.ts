@@ -51,7 +51,23 @@ async function main() {
 
   const repoRegistry = new RepositoryRegistry(config);
   const agentRegistry = new AgentRegistry(config);
-  const processManager = new ProcessManager(config.server.workspace_grace_period_ms);
+  const processManager = new ProcessManager(
+    config.server.workspace_grace_period_ms,
+    config.server.data_dir
+  );
+
+  // Safely recover and terminate any verifiable orphaned worker processes from previous crash
+  try {
+    const recoveredWorkers = await processManager.recoverOrphanedWorkers();
+    if (recoveredWorkers > 0) {
+      console.error(
+        `[coding-agent-mcp] Terminated ${recoveredWorkers} orphaned worker processes from previous crash.`
+      );
+    }
+  } catch {
+    // Non-blocking recovery error
+  }
+
   const verificationService = new VerificationService(
     config.server.default_task_timeout_seconds,
     config.server.output_limit_bytes

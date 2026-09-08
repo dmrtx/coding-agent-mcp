@@ -8,26 +8,54 @@ import { assertPathContained } from "../security/path-policy.js";
 function execFilePromise(
   file: string,
   args: string[],
-  options: { cwd: string }
+  options: { cwd: string; maxBuffer?: number }
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
     execFile(
       file,
       args,
-      options,
-      (error: (Error & { code?: number | string }) | null, stdout: string, stderr: string) => {
-        const exitCode = typeof error?.code === "number" ? error.code : error ? 1 : 0;
-        if (error && exitCode !== 1) {
-          reject(
-            new CodingAgentError(
-              ErrorCodes.INTERNAL_ERROR,
-              `Git command failed: git ${args.join(" ")} in ${options.cwd}. ${stderr || error.message}`,
-              { stdout, stderr, exitCode }
-            )
-          );
+      {
+        cwd: options.cwd,
+        maxBuffer: options.maxBuffer ?? 50 * 1024 * 1024, // 50 MiB to prevent premature 1 MiB truncation
+      },
+      (error: (Error & { code?: number | string; status?: number }) | null, stdout: string, stderr: string) => {
+        if (error) {
+          // Explicitly check for buffer overflow
+          if ((error as any).code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+            reject(
+              new CodingAgentError(
+                ErrorCodes.INTERNAL_ERROR,
+                `Git output exceeded buffer limit in ${options.cwd}`,
+                { stdout: stdout ? stdout.slice(0, 1000) : "", stderr }
+              )
+            );
+            return;
+          }
+
+          // In git diff, exit code 1 indicates differences were found, not a fatal failure
+          const exitCode =
+            typeof (error as any).status === "number"
+              ? (error as any).status
+              : typeof error.code === "number"
+              ? error.code
+              : 1;
+
+          if (exitCode !== 1 && exitCode !== 0) {
+            reject(
+              new CodingAgentError(
+                ErrorCodes.INTERNAL_ERROR,
+                `Git command failed: ${file} ${args.join(" ")} in ${options.cwd}. ${stderr || error.message}`,
+                { stdout, stderr, exitCode }
+              )
+            );
+            return;
+          }
+
+          resolve({ stdout, stderr, exitCode });
           return;
         }
-        resolve({ stdout, stderr, exitCode });
+
+        resolve({ stdout, stderr, exitCode: 0 });
       }
     );
   });

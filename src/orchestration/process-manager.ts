@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 
 export interface SpawnProcessOptions {
@@ -21,6 +21,7 @@ export interface ActiveProcess {
   taskId: string;
   pid: number;
   child: ChildProcess;
+  watchdog?: ChildProcess;
   logStream: fs.WriteStream;
   stdoutStream: fs.WriteStream;
   stderrStream: fs.WriteStream;
@@ -33,12 +34,49 @@ export interface ActiveProcess {
   startTime: number;
 }
 
+export interface WorkerIdentity {
+  taskId: string;
+  pid: number;
+  command: string;
+  args: string[];
+  cwd: string;
+  startedAt: number;
+}
+
 export class ProcessManager {
   private readonly activeProcesses: Map<string, ActiveProcess> = new Map();
+  private readonly reservedTaskIds: Set<string> = new Set();
   private readonly gracePeriodMs: number;
+  private readonly dataDir?: string;
 
-  constructor(gracePeriodMs = 3000) {
+  constructor(gracePeriodMs = 3000, dataDir?: string) {
     this.gracePeriodMs = gracePeriodMs;
+    this.dataDir = dataDir;
+  }
+
+  public reserveSlot(taskId: string, maxConcurrent: number): void {
+    const totalActive = this.activeProcesses.size + this.reservedTaskIds.size;
+    if (totalActive >= maxConcurrent) {
+      throw new CodingAgentError(
+        ErrorCodes.CONCURRENCY_LIMIT_REACHED,
+        `Maximum concurrent tasks (${maxConcurrent}) reached. Wait for an active task to finish.`,
+        { maxConcurrent, activeTasks: totalActive }
+      );
+    }
+
+    if (this.activeProcesses.has(taskId) || this.reservedTaskIds.has(taskId)) {
+      throw new CodingAgentError(
+        ErrorCodes.TASK_NOT_RESUMABLE,
+        `Task '${taskId}' is already running or currently being started.`,
+        { taskId }
+      );
+    }
+
+    this.reservedTaskIds.add(taskId);
+  }
+
+  public releaseSlot(taskId: string): void {
+    this.reservedTaskIds.delete(taskId);
   }
 
   public spawnProcess(options: SpawnProcessOptions): number {
@@ -56,6 +94,7 @@ export class ProcessManager {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err: any) {
+      this.reservedTaskIds.delete(options.taskId);
       logStream.end();
       stdoutStream.end();
       stderrStream.end();
@@ -67,6 +106,7 @@ export class ProcessManager {
     }
 
     if (!child.pid) {
+      this.reservedTaskIds.delete(options.taskId);
       logStream.end();
       stdoutStream.end();
       stderrStream.end();
@@ -77,23 +117,82 @@ export class ProcessManager {
     }
 
     const pid = child.pid;
+
+    // Measure existing cumulative log size for per-task output capping
+    let initialBytes = 0;
+    try {
+      if (fs.existsSync(options.logPath)) {
+        initialBytes = fs.statSync(options.logPath).size;
+      }
+    } catch {
+      // Ignore
+    }
+
     const maxOutputBytes = options.maxOutputBytes ?? 5_000_000;
+    const isAlreadyTruncated = initialBytes >= maxOutputBytes;
+
+    // Attach inline guardian watchdog process:
+    // If parent process dies abruptly (SIGKILL), the pipe closes and watchdog terminates the child process group
+    let watchdog: ChildProcess | undefined;
+    try {
+      const watchdogScript = `
+        const [parentPid, childPid] = process.argv.slice(1).map(Number);
+        process.stdin.resume();
+        process.stdin.on('end', cleanup);
+        process.stdin.on('close', cleanup);
+        process.stdin.on('error', cleanup);
+        const timer = setInterval(() => {
+          try { process.kill(parentPid, 0); } catch { cleanup(); }
+          try { process.kill(childPid, 0); } catch { clearInterval(timer); process.exit(0); }
+        }, 500);
+        function cleanup() {
+          clearInterval(timer);
+          try { process.kill(-childPid, 'SIGTERM'); } catch { try { process.kill(childPid, 'SIGTERM'); } catch {} }
+          setTimeout(() => {
+            try { process.kill(-childPid, 'SIGKILL'); } catch { try { process.kill(childPid, 'SIGKILL'); } catch {} }
+            process.exit(0);
+          }, 2000);
+        }
+      `;
+      watchdog = spawn(process.execPath, ["-e", watchdogScript, String(process.pid), String(pid)], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      watchdog.unref();
+    } catch {
+      // Watchdog is best-effort defense-in-depth
+    }
 
     const active: ActiveProcess = {
       taskId: options.taskId,
       pid,
       child,
+      watchdog,
       logStream,
       stdoutStream,
       stderrStream,
       timedOut: false,
       cancelled: false,
-      outputTruncated: false,
-      bytesWritten: 0,
+      outputTruncated: isAlreadyTruncated,
+      bytesWritten: initialBytes,
       startTime: Date.now(),
     };
 
     this.activeProcesses.set(options.taskId, active);
+    this.reservedTaskIds.delete(options.taskId);
+
+    this.saveActiveWorkerIdentity({
+      taskId: options.taskId,
+      pid,
+      command: options.command,
+      args: options.args,
+      cwd: options.cwd,
+      startedAt: Date.now(),
+    });
+
+    if (isAlreadyTruncated && options.onOutputTruncated) {
+      options.onOutputTruncated();
+    }
 
     const handleChunk = (data: Buffer, isStderr: boolean) => {
       const text = data.toString("utf-8");
@@ -101,7 +200,8 @@ export class ProcessManager {
         options.onOutput(text, isStderr);
       }
 
-      if (active.bytesWritten + data.length > maxOutputBytes) {
+      const remaining = maxOutputBytes - active.bytesWritten;
+      if (remaining <= 0) {
         if (!active.outputTruncated) {
           active.outputTruncated = true;
           const warning = "\n[coding-agent-mcp] Output limit exceeded. Truncating further stream log.\n";
@@ -113,12 +213,22 @@ export class ProcessManager {
         return;
       }
 
-      active.bytesWritten += data.length;
-      logStream.write(data);
+      const toWrite = data.length > remaining ? data.subarray(0, remaining) : data;
+      active.bytesWritten += toWrite.length;
+      logStream.write(toWrite);
       if (isStderr) {
-        stderrStream.write(data);
+        stderrStream.write(toWrite);
       } else {
-        stdoutStream.write(data);
+        stdoutStream.write(toWrite);
+      }
+
+      if (data.length > remaining) {
+        active.outputTruncated = true;
+        const warning = "\n[coding-agent-mcp] Output limit exceeded. Truncating further stream log.\n";
+        logStream.write(warning);
+        if (isStderr) stderrStream.write(warning);
+        else stdoutStream.write(warning);
+        options.onOutputTruncated?.();
       }
     };
 
@@ -153,6 +263,7 @@ export class ProcessManager {
       stderrStream.end();
 
       this.activeProcesses.delete(options.taskId);
+      this.removeActiveWorkerIdentity(options.taskId);
 
       if (options.onExit) {
         options.onExit(code, signal, active.timedOut);
@@ -210,7 +321,12 @@ export class ProcessManager {
       active.stderrStream.end();
     }
 
+    for (const taskId of this.activeProcesses.keys()) {
+      this.removeActiveWorkerIdentity(taskId);
+    }
+
     this.activeProcesses.clear();
+    this.reservedTaskIds.clear();
   }
 
   public isProcessRunning(taskId: string): boolean {
@@ -218,7 +334,111 @@ export class ProcessManager {
   }
 
   public getRunningProcessCount(): number {
-    return this.activeProcesses.size;
+    return this.activeProcesses.size + this.reservedTaskIds.size;
+  }
+
+  public async recoverOrphanedWorkers(): Promise<number> {
+    if (!this.dataDir) return 0;
+    const workers = this.loadActiveWorkerIdentities();
+    if (workers.length === 0) return 0;
+
+    let recovered = 0;
+    for (const worker of workers) {
+      try {
+        // 1. Check if PID is alive
+        process.kill(worker.pid, 0);
+      } catch {
+        // Process is already dead
+        continue;
+      }
+
+      // 2. Verify verifiable identity: does the PID's actual command match worker?
+      try {
+        const cmdOutput = execFileSync("ps", ["-p", String(worker.pid), "-o", "command="], {
+          encoding: "utf-8",
+        }).trim();
+
+        const matchesCommand =
+          cmdOutput.includes(worker.command) ||
+          cmdOutput.includes(worker.taskId) ||
+          (worker.args && worker.args.some((arg) => arg.length > 3 && cmdOutput.includes(arg)));
+
+        if (!matchesCommand) {
+          console.error(
+            `[coding-agent-mcp] Stale PID ${worker.pid} has been recycled by another process (${cmdOutput}). Skipping.`
+          );
+          continue;
+        }
+
+        // Identity confirmed: safely terminate orphaned process group
+        console.error(
+          `[coding-agent-mcp] Terminating orphaned worker PID ${worker.pid} for task ${worker.taskId}...`
+        );
+        this.killProcessTree(worker.pid, "SIGTERM");
+        await new Promise((r) => setTimeout(r, this.gracePeriodMs));
+        try {
+          process.kill(worker.pid, 0);
+          this.killProcessTree(worker.pid, "SIGKILL");
+        } catch {
+          // Already gone
+        }
+        recovered++;
+      } catch {
+        // Process could not be inspected or killed
+      }
+    }
+
+    try {
+      const file = path.join(this.dataDir, "active-workers.json");
+      if (fs.existsSync(file)) {
+        fs.unlinkSync(file);
+      }
+    } catch {
+      // Ignore
+    }
+
+    return recovered;
+  }
+
+  private saveActiveWorkerIdentity(worker: WorkerIdentity): void {
+    if (!this.dataDir) return;
+    try {
+      const file = path.join(this.dataDir, "active-workers.json");
+      const current = this.loadActiveWorkerIdentities();
+      current.push(worker);
+      fs.writeFileSync(file, JSON.stringify(current, null, 2), "utf-8");
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  private removeActiveWorkerIdentity(taskId: string): void {
+    if (!this.dataDir) return;
+    try {
+      const file = path.join(this.dataDir, "active-workers.json");
+      const current = this.loadActiveWorkerIdentities();
+      const filtered = current.filter((w) => w.taskId !== taskId);
+      if (filtered.length > 0) {
+        fs.writeFileSync(file, JSON.stringify(filtered, null, 2), "utf-8");
+      } else if (fs.existsSync(file)) {
+        fs.unlinkSync(file);
+      }
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  private loadActiveWorkerIdentities(): WorkerIdentity[] {
+    if (!this.dataDir) return [];
+    try {
+      const file = path.join(this.dataDir, "active-workers.json");
+      if (fs.existsSync(file)) {
+        return JSON.parse(fs.readFileSync(file, "utf-8")) as WorkerIdentity[];
+      }
+    } catch {
+      // Non-blocking
+    }
+    return [];
   }
 
   private killProcessTree(pid: number, signal: NodeJS.Signals): void {

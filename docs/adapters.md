@@ -12,14 +12,17 @@
 
 ### Headless Execution
 - When `start_task` is invoked:
-  `muse exec --workspace <workspaceRoot> --approval-mode never --disable-approval --session-id <uuid> "<instruction>"`
-- Notice: `--yolo` is strictly **omitted** to retain Meta's shell/filesystem sandbox active.
-- If `mode` is `review` or `investigate`, `--disable-write` is added to prevent unintended workspace mutations.
+  `muse exec --workspace <workspaceRoot> --trust-workspace --approval-mode never --disable-approval --session-id <uuid> "<instruction>"`
+- Notice:
+  - `--trust-workspace` is passed to prevent interactive trust prompts in freshly created worktrees.
+  - `--yolo` is strictly **omitted** to retain Meta's shell/filesystem sandbox active.
+  - If `mode` is `review` or `investigate`, both `--disable-write` and `--disable-shell` are added to guarantee a strictly read-only audit environment.
 - Session ID is tracked for resumption and task continuation.
 
 ### Continuation
 - When `continue_task` is called:
-  `muse exec --workspace <workspaceRoot> --approval-mode never --disable-approval --session-id <uuid> "<instruction>"`
+  `muse exec --workspace <workspaceRoot> --trust-workspace --approval-mode never --disable-approval --session-id <uuid> "<instruction>"`
+- Read-only flags (`--disable-write` and `--disable-shell`) and `--trust-workspace` are preserved during continuations.
 
 ---
 
@@ -33,18 +36,21 @@
 - When `start_task` is invoked:
   `agy --print "<instruction>" --output-format json --sandbox --dangerously-skip-permissions`
   (executed with working directory set to the task workspace).
-- Notice: `--sandbox` is explicitly enabled to enforce terminal and filesystem sandbox restrictions.
-- `--output-format json` emits structured output from which the real `conversation_id` is parsed and stored.
-- If `mode` is `review` or `investigate`, `--mode plan` is added.
+- Notice:
+  - `--sandbox` is explicitly enabled to enforce terminal execution restrictions.
+  - `--dangerously-skip-permissions` is required in headless print mode so that tool calls proceed without interactive stdin confirmation prompts.
+  - `--output-format json` emits structured output from which the real `conversation_id` is parsed and stored.
+  - If `mode` is `review` or `investigate`, `--mode plan` is added.
 
-### Continuation
+### Continuation & Session Resumption
 - When `continue_task` is called:
   `agy --print "<instruction>" --output-format json --sandbox --dangerously-skip-permissions --conversation <conversationId>`
-  (or `--continue` if no conversation ID was captured).
+- **Strict session resumption**: `sessionId` is strictly required. If no conversation ID was captured from the initial execution, the task cannot be continued and is rejected with `TASK_NOT_RESUMABLE`. Global fallback `--continue` is never used.
+- In `review` and `investigate` modes, `--mode plan` is preserved in continuation calls.
 
 ---
 
 ## 3. Fake Agent Adapter (`fake-agent`)
 
 - Designed for deterministic unit and integration testing without requiring external binaries or network credentials.
-- Simulates file modifications, log outputs, sleep commands, and non-zero exit codes.
+- Simulates file modifications, log outputs, sleep commands, session continuation, and non-zero exit codes.
