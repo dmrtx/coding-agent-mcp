@@ -199,6 +199,20 @@ function setupEnv(opts: { outputLimitBytes?: number } = {}) {
   };
 }
 
+async function waitForTerminal(
+  taskManager: import("../../src/orchestration/task-manager.js").TaskManager,
+  taskId: string,
+  timeoutMs = 8000
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const task = taskManager.getTask(taskId);
+    if (task.status !== "running" && task.status !== "starting") return task;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for terminal ${taskId}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 async function startManaged(env: ReturnType<typeof setupEnv>, stub: StubManagedContinueAgent) {
   const started = await env.taskManager.startTask({
     repository: "test-repo",
@@ -206,7 +220,9 @@ async function startManaged(env: ReturnType<typeof setupEnv>, stub: StubManagedC
     instruction: "do managed work",
     mode: "implement",
   });
-  assert.equal(started.status, "completed");
+  assert.equal(started.status, "running");
+  const terminal = await waitForTerminal(env.taskManager, started.task_id);
+  assert.equal(terminal.status, "completed");
   return started;
 }
 

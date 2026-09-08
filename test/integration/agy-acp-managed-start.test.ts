@@ -125,6 +125,20 @@ function assertNoRawProtocol(output: string): void {
   assert.ok(!output.includes('"stopReason"'), "output must not contain raw stopReason");
 }
 
+async function waitForTerminal(
+  taskManager: import("../../src/orchestration/task-manager.js").TaskManager,
+  taskId: string,
+  timeoutMs = 30000
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const task = taskManager.getTask(taskId);
+    if (task.status !== "running" && task.status !== "starting") return task;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for terminal ${taskId}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 test("managed start via TaskManager completes with session and normalized output", async () => {
   const env = setupEnv({ allowWrite: false });
   try {
@@ -134,9 +148,10 @@ test("managed start via TaskManager completes with session and normalized output
       instruction: "read the readme",
       mode: "implement",
     });
-    assert.equal(started.status, "completed");
+    // Managed start is async: returns running promptly, settles in background.
+    assert.equal(started.status, "running");
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "completed");
     assert.ok(
       typeof task.sessionId === "string" && task.sessionId.length > 0,
@@ -194,9 +209,9 @@ test("managed start review + write probe maps terminal denial to POLICY_DENIED",
       instruction: "review this change [[WRITE_PROBE]]",
       mode: "review",
     });
-    assert.equal(started.status, "failed");
+    assert.equal(started.status, "running");
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "failed");
     assert.equal(task.failure?.code, "POLICY_DENIED");
 
@@ -218,9 +233,9 @@ test("managed start implement + write probe with gate off denies", async () => {
       instruction: "edit notes [[WRITE_PROBE]]",
       mode: "implement",
     });
-    assert.equal(started.status, "failed");
+    assert.equal(started.status, "running");
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "failed");
     assert.equal(task.failure?.code, "POLICY_DENIED");
 
@@ -241,9 +256,9 @@ test("managed start implement + write probe with gate on and contained path comp
       instruction: "edit notes [[WRITE_PROBE]]",
       mode: "implement",
     });
-    assert.equal(started.status, "completed");
+    assert.equal(started.status, "running");
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "completed");
     assert.ok(typeof task.sessionId === "string" && task.sessionId.length > 0);
     assert.equal(task.sessionResumable, true);
@@ -266,9 +281,9 @@ test("managed start empty output maps to INTERNAL_ERROR", async () => {
       instruction: "do nothing [[EMPTY_OUTPUT]]",
       mode: "implement",
     });
-    assert.equal(started.status, "failed");
+    assert.equal(started.status, "running");
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "failed");
     assert.equal(task.failure?.code, "INTERNAL_ERROR");
     assert.equal(env.processManager.getRunningProcessCount(), 0);

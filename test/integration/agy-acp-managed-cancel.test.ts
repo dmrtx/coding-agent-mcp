@@ -161,10 +161,24 @@ function readAudits(dataDir: string): Array<Record<string, any>> {
 }
 
 /**
- * The startTask promise resolves only after the managed run settles, so the
- * task id is undiscoverable from its return while blocked. Poll the adapter
+ * Managed start is async: startTask returns running promptly with the task
+ * id, while the kernel turn settles in the background. Poll the adapter
  * state dir for the task whose kernel trace proves session/prompt is active.
  */
+
+async function waitForTerminalTask(
+  taskManager: import("../../src/orchestration/task-manager.js").TaskManager,
+  taskId: string,
+  timeoutMs = 30000
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const task = taskManager.getTask(taskId);
+    if (task.status !== "running" && task.status !== "starting") return task;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for terminal ${taskId}`);
+    await sleep(50);
+  }
+}
 async function waitForTaskWithActivePrompt(
   stateDir: string,
   minPromptCount = 1,
@@ -209,19 +223,23 @@ async function waitForPidGone(pid: number, timeoutMs = 15000): Promise<void> {
 test("managed start BLOCK_UNTIL_CANCEL cancels cooperatively with a single terminal audit", async () => {
   const env = setupEnv();
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: "agy-acp",
       instruction: "long job [[BLOCK_UNTIL_CANCEL]]",
       mode: "implement",
     });
-    const taskId = await waitForTaskWithActivePrompt(env.stateDir);
+    assert.equal(started.status, "running");
+    const taskId = started.task_id;
+    // Cross-check the background turn is truly active in the fake kernel.
+    const tracedId = await waitForTaskWithActivePrompt(env.stateDir);
+    assert.equal(tracedId, taskId);
 
     const cancelled = await env.taskManager.cancelTask(taskId);
     assert.deepEqual(cancelled, { task_id: taskId, cancelled: true });
 
-    const settled = await startPromise;
-    assert.equal(settled.task_id, taskId);
+    const settled = await waitForTerminalTask(env.taskManager, taskId);
+    assert.equal(settled.id, taskId);
     assert.equal(settled.status, "cancelled");
 
     const task = env.taskManager.getTask(taskId);
@@ -261,21 +279,24 @@ test("managed start BLOCK_UNTIL_CANCEL cancels cooperatively with a single termi
 test("managed start IGNORE_CANCEL falls back to adapter-owned termination", async () => {
   const env = setupEnv();
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: "agy-acp",
       instruction: "stuck job [[IGNORE_CANCEL]]",
       mode: "implement",
     });
-    const taskId = await waitForTaskWithActivePrompt(env.stateDir);
+    assert.equal(started.status, "running");
+    const taskId = started.task_id;
+    const tracedId = await waitForTaskWithActivePrompt(env.stateDir);
+    assert.equal(tracedId, taskId);
 
     // The adapter owns the fallback kill, so TaskManager still reports
     // acknowledged/true even though the kernel never settles the prompt.
     const cancelled = await env.taskManager.cancelTask(taskId);
     assert.deepEqual(cancelled, { task_id: taskId, cancelled: true });
 
-    const settled = await startPromise;
-    assert.equal(settled.task_id, taskId);
+    const settled = await waitForTerminalTask(env.taskManager, taskId);
+    assert.equal(settled.id, taskId);
     assert.equal(settled.status, "cancelled");
 
     const task = env.taskManager.getTask(taskId);
@@ -315,7 +336,9 @@ test("cancel during managed continue keeps the session and the cancelled state",
       instruction: "read the readme",
       mode: "implement",
     });
-    assert.equal(started.status, "completed");
+    assert.equal(started.status, "running");
+    const terminalStart = await waitForTerminalTask(env.taskManager, started.task_id);
+    assert.equal(terminalStart.status, "completed");
     const sessionId = env.taskManager.getTask(started.task_id).sessionId;
     assert.ok(typeof sessionId === "string" && sessionId.length > 0);
 
@@ -370,17 +393,20 @@ test("cancel during managed continue keeps the session and the cancelled state",
 test("duplicate cancel after terminal keeps TASK_NOT_RUNNING with no extra audit", async () => {
   const env = setupEnv();
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: "agy-acp",
       instruction: "long job [[BLOCK_UNTIL_CANCEL]]",
       mode: "implement",
     });
-    const taskId = await waitForTaskWithActivePrompt(env.stateDir);
+    assert.equal(started.status, "running");
+    const taskId = started.task_id;
+    const tracedId = await waitForTaskWithActivePrompt(env.stateDir);
+    assert.equal(tracedId, taskId);
 
     const cancelled = await env.taskManager.cancelTask(taskId);
     assert.deepEqual(cancelled, { task_id: taskId, cancelled: true });
-    const settled = await startPromise;
+    const settled = await waitForTerminalTask(env.taskManager, taskId);
     assert.equal(settled.status, "cancelled");
 
     const auditsBefore = readAudits(env.dataDir).filter((e) => e.taskId === taskId);

@@ -162,6 +162,20 @@ function setupEnv(opts: { outputLimitBytes?: number } = {}) {
   };
 }
 
+async function waitForTerminal(
+  taskManager: import("../../src/orchestration/task-manager.js").TaskManager,
+  taskId: string,
+  timeoutMs = 8000
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const task = taskManager.getTask(taskId);
+    if (task.status !== "running" && task.status !== "starting") return task;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for terminal ${taskId}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 test("legacy path still works when managed hook is absent", async () => {
   const env = setupEnv();
   env.agentRegistry.registerAgent(new FakeAgentAdapter());
@@ -206,8 +220,9 @@ test("managed start completes, persists session, and captures output", async () 
       mode: "implement",
     });
 
-    // Managed path settles synchronously inside startTask.
-    assert.equal(started.status, "completed");
+    // Managed start is asynchronous: startTask returns running promptly and
+    // the detached settlement completes shortly after.
+    assert.equal(started.status, "running");
     assert.equal(stub.prepareStartCalled, false);
 
     // Hook input contract.
@@ -218,7 +233,7 @@ test("managed start completes, persists session, and captures output", async () 
     assert.equal(stub.seenInput.mode, "implement");
     assert.ok((stub.seenInput.timeoutMs ?? 0) > 0);
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "completed");
     assert.equal(task.exitCode, 0);
     assert.equal(task.sessionId, "sess-stub-123");
@@ -256,9 +271,9 @@ test("managed failure maps supplied code/message/details", async () => {
       agent: "stub-managed",
       instruction: "do failing work",
     });
-    assert.equal(started.status, "failed");
+    assert.equal(started.status, "running");
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "failed");
     assert.equal(task.failure?.code, "POLICY_DENIED");
     assert.equal(task.failure?.message, "stub denied write");
@@ -282,9 +297,9 @@ test("managed cancel maps to cancelled", async () => {
       agent: "stub-managed",
       instruction: "do cancellable work",
     });
-    assert.equal(started.status, "cancelled");
+    assert.equal(started.status, "running");
 
-    const task = env.taskManager.getTask(started.task_id);
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.status, "cancelled");
     assert.equal(task.failure?.code, "TASK_CANCELLED");
 
@@ -307,7 +322,8 @@ test("managed completion releases slot with no double completion/audit race", as
       agent: "stub-managed",
       instruction: "race check",
     });
-    assert.equal(started.status, "completed");
+    assert.equal(started.status, "running");
+    await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(env.processManager.getRunningProcessCount(), 0);
 
     // Post-completion cancel must be rejected and must not mutate/audit.
@@ -332,7 +348,8 @@ test("managed completion releases slot with no double completion/audit race", as
       agent: "stub-managed",
       instruction: "second race check",
     });
-    assert.equal(second.status, "completed");
+    assert.equal(second.status, "running");
+    await waitForTerminal(env.taskManager, second.task_id);
     assert.equal(env.processManager.getRunningProcessCount(), 0);
   } finally {
     env.cleanup();
@@ -348,8 +365,8 @@ test("managed output respects existing output-limit accounting", async () => {
       agent: "stub-managed",
       instruction: "limit check",
     });
-    assert.equal(started.status, "completed");
-    const task = env.taskManager.getTask(started.task_id);
+    assert.equal(started.status, "running");
+    const task = await waitForTerminal(env.taskManager, started.task_id);
     assert.equal(task.outputTruncated, true);
     const audits = env.readAudits().filter((e) => e.taskId === started.task_id);
     assert.ok(audits.some((e) => e.type === "agent.output_truncated"));
