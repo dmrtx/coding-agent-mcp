@@ -32,6 +32,7 @@ Worker agents must never run with unconstrained system access.
 - Dynamic filesystem paths from callers are rejected.
 - Path traversal (`../`) and symlink escapes outside the repository root or worktree root are detected and blocked using realpath canonical checks (`PathPolicy`).
 - Untracked symbolic links in diff generation are safely ignored to prevent indirect access to sensitive host files outside repositories.
+- `server.data_dir` must be disjoint from every configured repository root: at startup/config validation, a `data_dir` that is equal to, inside, or contains any repository root is rejected with `POLICY_DENIED` identifying the conflicting repository alias. The comparison is realpath-aware (via `canonicalizePath`), so symlinks on either side cannot bypass it. This keeps security-sensitive runtime state (AGY isolated homes, copied credentials, task databases, logs, workspaces) out of Git status, diffs, agent-visible files, and commits.
 
 ---
 

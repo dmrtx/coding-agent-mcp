@@ -4,6 +4,7 @@ import path from "node:path";
 import yaml from "yaml";
 import { AppConfig, AppConfigSchema } from "./schema.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
+import { assertDataDirDisjointFromRepositories } from "../security/path-policy.js";
 
 export function expandHome(filePath: string): string {
   if (filePath.startsWith("~/") || filePath === "~") {
@@ -90,6 +91,8 @@ export function loadConfig(customPath?: string, rawOverrides?: Partial<AppConfig
   for (const [alias, repo] of Object.entries(config.repositories)) {
     repo.root = path.resolve(expandHome(repo.root));
   }
+
+  assertDataDirDisjointFromRepositories(config.server.data_dir, config.repositories);
 
   return config;
 }
