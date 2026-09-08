@@ -78,6 +78,20 @@ export interface ManagedStartResult {
   failureDetails?: Record<string, unknown>;
 }
 
+export interface ManagedContinueInput {
+  taskId: string;
+  repositoryRoot: string;
+  workspaceRoot: string;
+  sessionId: string;
+  instruction: string;
+  mode: AgentTaskMode;
+  timeoutMs: number;
+  environment: Record<string, string>;
+  onOutput?: (text: string, isStderr?: boolean) => void;
+}
+
+export type ManagedContinueResult = ManagedStartResult;
+
 export interface CodingAgent {
   readonly id: string;
   readonly displayName: string;
@@ -93,4 +107,6 @@ export interface CodingAgent {
   interpretResult?(stdout: string, stderr: string): AgentResultInterpretation;
 
   runManagedStart?(input: ManagedStartInput): Promise<ManagedStartResult>;
+
+  runManagedContinue?(input: ManagedContinueInput): Promise<ManagedContinueResult>;
 }
