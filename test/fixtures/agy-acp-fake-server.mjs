@@ -15,6 +15,14 @@ let sessionCounter = 0;
 let permissionCounter = 9000;
 const sessions = new Map(); // sessionId -> { sessionId, cwd, model, options }
 const pendingPrompts = new Map(); // permissionRequestId -> { origId, sessionId }
+// Cancel-test markers (phase 2A cancel slice, test-only):
+// - [[BLOCK_UNTIL_CANCEL]]: session/prompt stays pending until session/cancel
+//   for the same session arrives; the cancel is acked and the prompt then
+//   completes with a cancelled stopReason.
+// - [[IGNORE_CANCEL]]: session/prompt stays pending forever, even across
+//   session/cancel, forcing the adapter's process-fallback path.
+const blockedPrompts = new Map(); // sessionId -> { origId }
+const ignoredPrompts = new Map(); // sessionId -> { origId }
 
 // Test-only cross-process session persistence for managed-continue tests.
 // A managed continue spawns a FRESH kernel process, so in-memory sessions
@@ -132,6 +140,18 @@ function handleRequest(msg) {
       }
       const promptText = typeof p.prompt === "string" ? p.prompt : "";
       sessions.get(sessionId).lastPrompt = typeof p.prompt === "string" ? p.prompt : null;
+      // Marker for cooperative cancel: hold the prompt open until the
+      // client sends session/cancel for this session (handled below).
+      if (promptText.includes("[[BLOCK_UNTIL_CANCEL]]")) {
+        blockedPrompts.set(sessionId, { origId: id });
+        return;
+      }
+      // Marker for fallback cancel: hold the prompt open forever, even
+      // across session/cancel, so the adapter must terminate the kernel.
+      if (promptText.includes("[[IGNORE_CANCEL]]")) {
+        ignoredPrompts.set(sessionId, { origId: id });
+        return;
+      }
       // Marker for empty output: complete end_turn with no assistant text
       // and no permission round-trip (isolates INTERNAL_ERROR mapping).
       if (promptText.includes("[[EMPTY_OUTPUT]]")) {
@@ -196,6 +216,26 @@ function handleRequest(msg) {
     case "session/cancel": {
       const sessionId = isRecord(params) && typeof params.sessionId === "string" ? params.sessionId : null;
       send({ jsonrpc: "2.0", id, result: { cancelled: true, sessionId } });
+      // Release a cooperatively blocked prompt with a cancelled stopReason.
+      // IGNORE_CANCEL prompts are deliberately never settled: the adapter
+      // must fall back to process termination (verified by cancel tests).
+      // Afterwards the kernel stays alive for normal adapter teardown
+      // (SIGTERM/stdin-end exits below), so no orphan can remain.
+      if (typeof sessionId === "string") {
+        const blocked = blockedPrompts.get(sessionId);
+        if (blocked) {
+          blockedPrompts.delete(sessionId);
+          send({
+            jsonrpc: "2.0",
+            id: blocked.origId,
+            result: {
+              stopReason: "cancelled",
+              sessionId,
+              assistantText: "fake assistant cancelled turn",
+            },
+          });
+        }
+      }
       return;
     }
 
@@ -317,4 +357,9 @@ process.stdin.on("data", (chunk) => {
   }
 });
 process.stdin.on("end", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
+process.on("SIGTERM", () => {
+  // Test evidence: cancel tests assert fallback SIGTERM lands after the
+  // session/cancel attempt (trace order), and that no orphan remains.
+  traceMethod("signal/SIGTERM");
+  process.exit(0);
+});
