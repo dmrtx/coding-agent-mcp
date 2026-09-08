@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { CodingTask, TaskStatus, TaskInstruction } from "../domain/task.js";
-import { AgentTaskMode } from "../domain/agent.js";
+import { AgentResultInterpretation, AgentTaskMode, CodingAgent } from "../domain/agent.js";
 import { WorkspaceStrategy, WorkspaceDescriptor } from "../domain/repository.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 import { RepositoryRegistry } from "../repositories/repository-registry.js";
@@ -211,7 +211,7 @@ export class TaskManager {
               task!.sessionResumable = false;
             }
           }
-          this.handleProcessExit(task!, code, signal, timedOut);
+          this.handleProcessExit(task!, code, signal, timedOut, agent);
         },
       });
 
@@ -386,7 +386,7 @@ export class TaskManager {
               // Non-blocking log reading
             }
           }
-          this.handleProcessExit(task!, code, signal, timedOut);
+          this.handleProcessExit(task!, code, signal, timedOut, agent);
         },
       });
 
@@ -527,11 +527,40 @@ export class TaskManager {
     };
   }
 
+  private interpretExitZeroResult(
+    task: CodingTask,
+    agent?: CodingAgent
+  ): AgentResultInterpretation | undefined {
+    if (!agent?.interpretResult) return undefined;
+    // Only the dedicated stdout capture is interpreted. If it is unavailable,
+    // skip structured interpretation entirely: feeding merged-log contents
+    // (which interleave stderr) into the interpreter risks false failures.
+    let stdout: string;
+    try {
+      stdout = fs.readFileSync(`${task.logPath}.stdout`, "utf-8");
+    } catch {
+      return undefined;
+    }
+    let stderr = "";
+    try {
+      stderr = fs.readFileSync(`${task.logPath}.stderr`, "utf-8");
+    } catch {
+      stderr = "";
+    }
+    try {
+      return agent.interpretResult(stdout, stderr);
+    } catch {
+      // An interpreter failure must never break the completion path
+      return undefined;
+    }
+  }
+
   private async handleProcessExit(
     task: CodingTask,
     code: number | null,
     signal: string | null,
-    timedOut: boolean
+    timedOut: boolean,
+    agent?: CodingAgent
   ): Promise<void> {
     task.finishedAt = new Date().toISOString();
     task.exitCode = code ?? undefined;
@@ -567,13 +596,32 @@ export class TaskManager {
         agentId: task.agentId,
       });
     } else if (code === 0) {
-      task.status = "completed";
-      this.auditStore.append({
-        type: "task.completed",
-        taskId: task.id,
-        agentId: task.agentId,
-        details: { exitCode: 0 },
-      });
+      const interpretation = this.interpretExitZeroResult(task, agent);
+      if (interpretation?.blocked) {
+        const failureCode = interpretation.failureCode ?? ErrorCodes.POLICY_DENIED;
+        task.status = "failed";
+        task.failure = {
+          code: failureCode,
+          message:
+            interpretation.reason ??
+            "Agent run exited 0 but reported a failure in structured output",
+          details: { exitCode: 0, ...interpretation.details },
+        };
+        this.auditStore.append({
+          type: "task.failed",
+          taskId: task.id,
+          agentId: task.agentId,
+          details: { exitCode: 0, code: failureCode, reason: interpretation.reason },
+        });
+      } else {
+        task.status = "completed";
+        this.auditStore.append({
+          type: "task.completed",
+          taskId: task.id,
+          agentId: task.agentId,
+          details: { exitCode: 0 },
+        });
+      }
     } else {
       task.status = "failed";
       task.failure = {

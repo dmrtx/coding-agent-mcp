@@ -1,3 +1,5 @@
+import type { ErrorCode } from "./errors.js";
+
 export type AgentCapability =
   | "interactive_session"
   | "resume_session"
@@ -44,6 +46,13 @@ export interface AgentProcessSpawnInfo {
   sessionId?: string;
 }
 
+export interface AgentResultInterpretation {
+  blocked: boolean;
+  reason?: string;
+  details?: Record<string, unknown>;
+  failureCode?: ErrorCode;
+}
+
 export interface CodingAgent {
   readonly id: string;
   readonly displayName: string;
@@ -55,4 +64,6 @@ export interface CodingAgent {
   prepareContinue?(input: AgentContinueInput): Promise<AgentProcessSpawnInfo>;
 
   extractSessionId?(stdout: string, stderr: string): string | undefined;
+
+  interpretResult?(stdout: string, stderr: string): AgentResultInterpretation;
 }

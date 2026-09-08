@@ -295,6 +295,209 @@ test("AgyAdapter isolates auth token outside workspace and keeps workspace git t
   }
 });
 
+test("AgyAdapter isolated settings grant workspace-scoped read_file only", async () => {
+  const adapter = new AgyAdapter({
+    enabled: true,
+    executable: "agy",
+    sandbox: true,
+    default_timeout_seconds: 1800,
+    env_allowlist: ["HOME", "PATH"],
+  });
+
+  const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-readscope-ws-"));
+  try {
+    const spawnInfo = await adapter.prepareStart({
+      taskId: "task-test-agy-readscope",
+      repositoryRoot: tmpWorkspace,
+      workspaceRoot: tmpWorkspace,
+      instruction: "list files",
+      mode: "implement",
+      timeoutMs: 60000,
+      environment: {},
+    });
+
+    const settingsFile = path.join(spawnInfo.env.HOME!, ".gemini", "antigravity-cli", "settings.json");
+    const raw = fs.readFileSync(settingsFile, "utf-8");
+    const settings = JSON.parse(raw);
+    const allow: string[] = settings.permissions.allow;
+
+    // Exactly one workspace-scoped read grant, expressed corruption-proof
+    // relative to the single trusted workspace (no absolute path characters
+    // in the rule string at all, so ')'/whitespace/control codes in an
+    // operator-controlled path cannot corrupt it).
+    assert.deepEqual(
+      allow.filter((entry) => entry.startsWith("read_file(")),
+      ["read_file(.)"]
+    );
+    assert.ok(!allow.includes("read_file(*)"), "Must never grant read_file(*)");
+    for (const entry of allow) {
+      assert.ok(!entry.includes("*"), `Settings allowlist must not use globs: ${entry}`);
+      assert.ok(!entry.startsWith("write_file"), `Settings must not grant writes: ${entry}`);
+    }
+    assert.ok(!allow.includes("command(*)"), "Must not grant command(*)");
+    assert.ok(!raw.includes("skip-permissions"), "Must not use dangerous skip-permissions");
+    assert.ok(!raw.includes("unsandboxed"), "Must not run unsandboxed");
+    // The facts that make `read_file(.)` unambiguous: exactly one trusted
+    // workspace, and the agent spawns with cwd inside it.
+    assert.deepEqual(settings.trustedWorkspaces, [tmpWorkspace]);
+    assert.equal(spawnInfo.cwd, tmpWorkspace);
+  } finally {
+    fs.rmSync(tmpWorkspace, { recursive: true, force: true });
+  }
+});
+
+test("AgyAdapter investigate mode keeps --mode plan like review mode", async () => {
+  const adapter = new AgyAdapter({
+    enabled: true,
+    executable: "agy",
+    sandbox: true,
+    default_timeout_seconds: 1800,
+    env_allowlist: ["HOME", "PATH"],
+  });
+
+  const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-investigate-ws-"));
+  try {
+    const investigateSpawn = await adapter.prepareStart({
+      taskId: "task-test-agy-investigate",
+      repositoryRoot: tmpWorkspace,
+      workspaceRoot: tmpWorkspace,
+      instruction: "investigate failure",
+      mode: "investigate",
+      timeoutMs: 60000,
+      environment: {},
+    });
+    assert.ok(investigateSpawn.args.includes("--mode"));
+    assert.equal(investigateSpawn.args[investigateSpawn.args.indexOf("--mode") + 1], "plan");
+
+    const continueSpawn = await adapter.prepareContinue({
+      taskId: "task-test-agy-investigate",
+      workspaceRoot: tmpWorkspace,
+      sessionId: "conv-real-1234",
+      instruction: "dig deeper",
+      mode: "investigate",
+      timeoutMs: 60000,
+      environment: {},
+    });
+    assert.ok(continueSpawn.args.includes("--mode"));
+    assert.equal(continueSpawn.args[continueSpawn.args.indexOf("--mode") + 1], "plan");
+  } finally {
+    fs.rmSync(tmpWorkspace, { recursive: true, force: true });
+  }
+});
+
+test("AgyAdapter interpretResult detects envelope denials without false-failing", () => {
+  const adapter = new AgyAdapter({
+    enabled: true,
+    executable: "agy",
+    sandbox: true,
+    default_timeout_seconds: 1800,
+    env_allowlist: ["HOME", "PATH"],
+  });
+  const env = (extra: Record<string, unknown>) => ({ conversation_id: "conv-1", ...extra });
+
+  // Full-blob envelope denials (denial evidence defaults to POLICY_DENIED)
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ status: "SUCCESS", denied_actions: ["read /etc/passwd"] })), "").blocked,
+    true
+  );
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ deniedActions: ["run rm -rf /"] })), "").blocked,
+    true
+  );
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ denied_tools: ["shell"] })), "").blocked,
+    true
+  );
+  for (const status of ["denied", "blocked", "permission_denied", "permission-denied", "permissionDenied"]) {
+    const result = adapter.interpretResult(JSON.stringify(env({ status })), "");
+    assert.equal(result.blocked, true, `status '${status}' must be treated as a denial`);
+    assert.equal(result.failureCode, undefined, "denial keeps the default POLICY_DENIED code");
+  }
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ status: "SUCCESS", denied_count: 2 })), "").blocked,
+    true
+  );
+
+  // Bare envelope ERROR without denial evidence fails honestly, not as POLICY_DENIED
+  const bareError = adapter.interpretResult(JSON.stringify(env({ status: "ERROR" })), "");
+  assert.equal(bareError.blocked, true);
+  assert.equal(bareError.failureCode, "INTERNAL_ERROR");
+
+  // The byte-faithful observed denial: SUCCESS envelope with denied_actions
+  const fixture = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "fixtures", "agy-denial-result.json"),
+    "utf-8"
+  );
+  const observed = adapter.interpretResult(fixture, "");
+  assert.equal(observed.blocked, true, "observed denial envelope must block");
+  assert.equal(observed.failureCode, undefined, "denial keeps the default POLICY_DENIED code");
+
+  // NDJSON denial on a later envelope line is detected; stream step lines ignored
+  const ndjson = [
+    JSON.stringify({ event: "init", conversation_id: "conv-1" }),
+    JSON.stringify({ event: "step_update", step_update: { state: "DONE" } }),
+    JSON.stringify(env({ status: "SUCCESS", denied_actions: ["write /etc/hosts"] })),
+  ].join("\n");
+  assert.equal(adapter.interpretResult(ndjson, "").blocked, true);
+
+  // Documented stream-json terminal line carries the envelope inside `result`
+  const streamResult = [
+    JSON.stringify({ event: "init", conversation_id: "conv-1" }),
+    JSON.stringify({ event: "result", result: { conversation_id: "conv-1", status: "SUCCESS", denied_actions: ["x"] } }),
+  ].join("\n");
+  assert.equal(adapter.interpretResult(streamResult, "").blocked, true);
+
+  // Non-denials must NOT block
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ status: "SUCCESS", response: "done" })), "").blocked,
+    false,
+    "valid success envelope must complete"
+  );
+  assert.equal(adapter.interpretResult("", "").blocked, false, "empty output must not block");
+  assert.equal(
+    adapter.interpretResult("just some prose output", "").blocked,
+    false,
+    "plain prose must not block"
+  );
+  assert.equal(
+    adapter.interpretResult("working...", "permission denied: sandbox blocked open").blocked,
+    false,
+    "stderr-only 'permission denied' must not block"
+  );
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ status: "in_progress" })), "").blocked,
+    false,
+    "unknown status must not block"
+  );
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ denied_actions: [] })), "").blocked,
+    false,
+    "empty denied list must not block"
+  );
+  assert.equal(
+    adapter.interpretResult(JSON.stringify(env({ status: "SUCCESS", denied_count: 0 })), "").blocked,
+    false,
+    "zero denied count must not block"
+  );
+
+  // Envelope/payload confusion: denial-shaped JSON WITHOUT envelope markers
+  // is agent output, not an AGY verdict, and must not block.
+  assert.equal(
+    adapter.interpretResult(JSON.stringify({ status: "error", denied_actions: ["x"] }), "").blocked,
+    false,
+    "denial keys without a conversation_id must not block"
+  );
+  // JSON nested inside the model's response string is never parsed.
+  const nested = JSON.stringify(
+    env({ status: "SUCCESS", response: '{"status":"error","denied_actions":["read /etc/passwd"]}' })
+  );
+  assert.equal(
+    adapter.interpretResult(nested, "").blocked,
+    false,
+    "denial JSON inside the response string must not block"
+  );
+});
+
 test("AgyAdapter setupAgySettings fails closed when configuration directory cannot be created", async () => {
   const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-failclose-ws-"));
   // Create an unwritable file where dataDir would be, so mkdirSync fails

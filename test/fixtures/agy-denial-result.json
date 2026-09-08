@@ -1,0 +1,1 @@
+{"conversation_id":"68ed6e74-9f0d-4f99-b4df-c452c0e90cc1","status":"SUCCESS","response":"","duration_seconds":3.452173,"num_turns":1,"usage":{"input_tokens":15059,"output_tokens":498,"thinking_tokens":423,"cache_read_tokens":0,"total_tokens":15557},"denied_actions":[{"action":"read_file","display_name":"ListDir"}]}

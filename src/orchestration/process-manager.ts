@@ -84,6 +84,23 @@ function canonicalizeDir(dir: string): string {
   }
 }
 
+// Resolves once a capture stream has flushed (or errored/closed), so readers
+// of the capture files observe complete output. Listening for "error" also
+// prevents an untimely stream error from surfacing as unhandled.
+function waitForStreamFlushed(stream: fs.WriteStream): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      stream.removeListener("finish", done);
+      stream.removeListener("error", done);
+      stream.removeListener("close", done);
+      resolve();
+    };
+    stream.once("finish", done);
+    stream.once("error", done);
+    stream.once("close", done);
+  });
+}
+
 export class ProcessManager {
   private readonly activeProcesses: Map<string, ActiveProcess> = new Map();
   private readonly reservedTaskIds: Set<string> = new Set();
@@ -341,9 +358,18 @@ export class ProcessManager {
       this.activeProcesses.delete(options.taskId);
       this.removeActiveWorkerIdentity(options.taskId);
 
-      if (options.onExit) {
-        options.onExit(code, signal, active.timedOut);
-      }
+      // Invoke onExit only after the capture streams have finished flushing,
+      // so handlers that read the capture files (e.g. result interpreters)
+      // never observe a truncated tail.
+      void Promise.all([
+        waitForStreamFlushed(logStream),
+        waitForStreamFlushed(stdoutStream),
+        waitForStreamFlushed(stderrStream),
+      ]).then(() => {
+        if (options.onExit) {
+          options.onExit(code, signal, active.timedOut);
+        }
+      });
     });
 
     return pid;
