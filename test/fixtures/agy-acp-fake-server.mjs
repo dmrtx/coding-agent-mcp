@@ -7,12 +7,85 @@
 // tests can exercise client-side permission handling at protocol level.
 //
 // Zero dependencies; only used by tests. Not shipped (lives under test/).
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 let sessionCounter = 0;
 let permissionCounter = 9000;
 const sessions = new Map(); // sessionId -> { sessionId, cwd, model, options }
 const pendingPrompts = new Map(); // permissionRequestId -> { origId, sessionId }
+// Cancel-test markers (phase 2A cancel slice, test-only):
+// - [[BLOCK_UNTIL_CANCEL]]: session/prompt stays pending until session/cancel
+//   for the same session arrives; the cancel is acked and the prompt then
+//   completes with a cancelled stopReason.
+// - [[IGNORE_CANCEL]]: session/prompt stays pending forever, even across
+//   session/cancel, forcing the adapter's process-fallback path.
+const blockedPrompts = new Map(); // sessionId -> { origId }
+const ignoredPrompts = new Map(); // sessionId -> { origId }
+
+// Test-only cross-process session persistence for managed-continue tests.
+// A managed continue spawns a FRESH kernel process, so in-memory sessions
+// alone cannot survive across turns. Enabled solely via
+// AGY_ACP_FAKE_PERSIST=1; state lives under $HOME (the isolated task HOME
+// in managed runs), so nothing is ever written outside the fake HOME.
+const PERSIST_ENABLED = process.env.AGY_ACP_FAKE_PERSIST === "1";
+
+function persistPaths() {
+  const home = process.env.HOME;
+  if (typeof home !== "string" || home.length === 0) return null;
+  return {
+    sessions: path.join(home, ".agy-acp-fake-sessions.json"),
+    trace: path.join(home, ".agy-acp-fake-trace.jsonl"),
+  };
+}
+
+/** Append-only per-process method trace (test evidence; never protocol). */
+function traceMethod(method) {
+  if (!PERSIST_ENABLED) return;
+  try {
+    const paths = persistPaths();
+    if (!paths) return;
+    fs.appendFileSync(paths.trace, `${JSON.stringify({ pid: process.pid, method })}\n`);
+  } catch {
+    // Test-only; never break protocol handling.
+  }
+}
+
+function loadPersistedSessions() {
+  if (!PERSIST_ENABLED) return;
+  try {
+    const paths = persistPaths();
+    if (!paths || !fs.existsSync(paths.sessions)) return;
+    const data = JSON.parse(fs.readFileSync(paths.sessions, "utf-8"));
+    if (!isRecord(data)) return;
+    if (typeof data.sessionCounter === "number" && data.sessionCounter > sessionCounter) {
+      sessionCounter = data.sessionCounter;
+    }
+    if (isRecord(data.sessions)) {
+      for (const [id, entry] of Object.entries(data.sessions)) {
+        if (!sessions.has(id) && isRecord(entry)) {
+          sessions.set(id, { cwd: null, model: null, options: {}, ...entry, sessionId: id });
+        }
+      }
+    }
+  } catch {
+    // Corrupt state must never break the fake kernel.
+  }
+}
+
+function persistSessions() {
+  if (!PERSIST_ENABLED) return;
+  try {
+    const paths = persistPaths();
+    if (!paths) return;
+    const tmp = `${paths.sessions}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ sessionCounter, sessions: Object.fromEntries(sessions) }));
+    fs.renameSync(tmp, paths.sessions);
+  } catch {
+    // Test-only; never break protocol handling.
+  }
+}
 
 function send(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -29,6 +102,7 @@ function errorTo(id, code, message) {
 function handleRequest(msg) {
   const { id, method, params } = msg;
   const p = isRecord(params) ? params : {};
+  traceMethod(method);
 
   switch (method) {
     case "initialize":
@@ -43,6 +117,8 @@ function handleRequest(msg) {
       return;
 
     case "session/new": {
+      // Load first so ids never collide with another process sharing HOME.
+      loadPersistedSessions();
       sessionCounter += 1;
       const sessionId = `sess-${sessionCounter}`;
       sessions.set(sessionId, {
@@ -51,6 +127,7 @@ function handleRequest(msg) {
         model: typeof p.model === "string" ? p.model : null,
         options: {},
       });
+      persistSessions();
       send({ jsonrpc: "2.0", id, result: { sessionId } });
       return;
     }
@@ -61,12 +138,68 @@ function handleRequest(msg) {
         errorTo(id, -32002, `Unknown session: ${String(sessionId)}`);
         return;
       }
+      const promptText = typeof p.prompt === "string" ? p.prompt : "";
       sessions.get(sessionId).lastPrompt = typeof p.prompt === "string" ? p.prompt : null;
+      // Marker for cooperative cancel: hold the prompt open until the
+      // client sends session/cancel for this session (handled below).
+      if (promptText.includes("[[BLOCK_UNTIL_CANCEL]]")) {
+        blockedPrompts.set(sessionId, { origId: id });
+        return;
+      }
+      // Marker for fallback cancel: hold the prompt open forever, even
+      // across session/cancel, so the adapter must terminate the kernel.
+      if (promptText.includes("[[IGNORE_CANCEL]]")) {
+        ignoredPrompts.set(sessionId, { origId: id });
+        return;
+      }
+      // Marker for empty output: complete end_turn with no assistant text
+      // and no permission round-trip (isolates INTERNAL_ERROR mapping).
+      if (promptText.includes("[[EMPTY_OUTPUT]]")) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          result: { stopReason: "end_turn", sessionId },
+        });
+        return;
+      }
+      // Marker for write probe: request a contained edit permission; final
+      // permissionOutcome mirrors the client reply and assistant text is
+      // only included when allowed (deny requires no success text).
+      if (promptText.includes("[[WRITE_PROBE]]")) {
+        permissionCounter += 1;
+        const permId = permissionCounter;
+        pendingPrompts.set(permId, { origId: id, sessionId, kind: "write" });
+        send({
+          jsonrpc: "2.0",
+          id: permId,
+          method: "session/request_permission",
+          params: {
+            sessionId,
+            toolCall: { toolCallId: `tc-${permId}`, tool: "edit", paths: ["notes.md"] },
+            reason: "fake kernel probe: edit notes.md",
+          },
+        });
+        return;
+      }
+      // Default/read prompt: assistant text notification plus one
+      // in-workspace read permission; final end_turn mirrors the client
+      // allow/deny as permissionOutcome with non-empty assistant text.
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "fake assistant update: reading README.md" },
+          },
+        },
+      });
       // Emit one inbound permission request; the prompt result follows once
       // the client answers (allow, deny, or JSON-RPC error — all complete).
       permissionCounter += 1;
       const permId = permissionCounter;
-      pendingPrompts.set(permId, { origId: id, sessionId });
+      pendingPrompts.set(permId, { origId: id, sessionId, kind: "read" });
       send({
         jsonrpc: "2.0",
         id: permId,
@@ -83,11 +216,36 @@ function handleRequest(msg) {
     case "session/cancel": {
       const sessionId = isRecord(params) && typeof params.sessionId === "string" ? params.sessionId : null;
       send({ jsonrpc: "2.0", id, result: { cancelled: true, sessionId } });
+      // Release a cooperatively blocked prompt with a cancelled stopReason.
+      // IGNORE_CANCEL prompts are deliberately never settled: the adapter
+      // must fall back to process termination (verified by cancel tests).
+      // Afterwards the kernel stays alive for normal adapter teardown
+      // (SIGTERM/stdin-end exits below), so no orphan can remain.
+      if (typeof sessionId === "string") {
+        const blocked = blockedPrompts.get(sessionId);
+        if (blocked) {
+          blockedPrompts.delete(sessionId);
+          send({
+            jsonrpc: "2.0",
+            id: blocked.origId,
+            result: {
+              stopReason: "cancelled",
+              sessionId,
+              assistantText: "fake assistant cancelled turn",
+            },
+          });
+        }
+      }
       return;
     }
 
     case "session/resume": {
       const sessionId = p.sessionId;
+      if (typeof sessionId === "string" && !sessions.has(sessionId)) {
+        // Cross-process resume: a previous kernel process may have persisted
+        // this session under the shared fake HOME.
+        loadPersistedSessions();
+      }
       if (typeof sessionId !== "string" || !sessions.has(sessionId)) {
         errorTo(id, -32002, `Unknown session: ${String(sessionId)}`);
         return;
@@ -134,10 +292,36 @@ function handleResponse(msg) {
   } else if (msg.result !== undefined) {
     outcome = "ok";
   }
+  if (pending.kind === "write") {
+    if (outcome === "allow") {
+      send({
+        jsonrpc: "2.0",
+        id: pending.origId,
+        result: {
+          stopReason: "end_turn",
+          sessionId: pending.sessionId,
+          permissionOutcome: outcome,
+          assistantText: "fake assistant completed write probe",
+        },
+      });
+    } else {
+      send({
+        jsonrpc: "2.0",
+        id: pending.origId,
+        result: { stopReason: "end_turn", sessionId: pending.sessionId, permissionOutcome: outcome },
+      });
+    }
+    return;
+  }
   send({
     jsonrpc: "2.0",
     id: pending.origId,
-    result: { stopReason: "end_turn", sessionId: pending.sessionId, permissionOutcome: outcome },
+    result: {
+      stopReason: "end_turn",
+      sessionId: pending.sessionId,
+      permissionOutcome: outcome,
+      assistantText: "fake assistant completed turn for read probe",
+    },
   });
 }
 
@@ -173,4 +357,9 @@ process.stdin.on("data", (chunk) => {
   }
 });
 process.stdin.on("end", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
+process.on("SIGTERM", () => {
+  // Test evidence: cancel tests assert fallback SIGTERM lands after the
+  // session/cancel attempt (trace order), and that no orphan remains.
+  traceMethod("signal/SIGTERM");
+  process.exit(0);
+});
