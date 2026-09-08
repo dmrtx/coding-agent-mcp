@@ -1,0 +1,125 @@
+import { execFile } from "node:child_process";
+import crypto from "node:crypto";
+import {
+  CodingAgent,
+  AgentDescriptor,
+  AgentStartInput,
+  AgentContinueInput,
+  AgentProcessSpawnInfo,
+} from "../domain/agent.js";
+import { AgentConfig } from "../config/schema.js";
+import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
+
+export class MuseAdapter implements CodingAgent {
+  public readonly id = "muse";
+  public readonly displayName = "Muse";
+  private readonly config: AgentConfig;
+
+  constructor(config: AgentConfig) {
+    this.config = config;
+  }
+
+  public async describe(): Promise<AgentDescriptor> {
+    if (!this.config.enabled) {
+      return {
+        id: this.id,
+        displayName: this.displayName,
+        available: false,
+        capabilities: ["modify_files", "resume_session"],
+      };
+    }
+
+    const executable = this.config.executable || "muse";
+    let available = false;
+    let version: string | undefined = undefined;
+
+    try {
+      const output = await new Promise<string>((resolve, reject) => {
+        execFile(executable, ["-V"], (err, stdout) => {
+          if (err) reject(err);
+          else resolve(stdout.trim());
+        });
+      });
+      available = true;
+      version = output;
+    } catch {
+      available = false;
+    }
+
+    return {
+      id: this.id,
+      displayName: this.displayName,
+      available,
+      version,
+      capabilities: ["modify_files", "resume_session"],
+    };
+  }
+
+  public async prepareStart(input: AgentStartInput): Promise<AgentProcessSpawnInfo> {
+    const executable = this.config.executable || "muse";
+    const sessionId = input.sessionId || crypto.randomUUID();
+
+    const args: string[] = [
+      "exec",
+      "--workspace",
+      input.workspaceRoot,
+      "--approval-mode",
+      "never",
+      "--yolo",
+      "--session-id",
+      sessionId,
+    ];
+
+    if (this.config.extra_args && this.config.extra_args.length > 0) {
+      args.push(...this.config.extra_args);
+    }
+
+    args.push(input.instruction);
+
+    return {
+      command: executable,
+      args,
+      cwd: input.workspaceRoot,
+      env: input.environment,
+      sessionId,
+    };
+  }
+
+  public async prepareContinue(input: AgentContinueInput): Promise<AgentProcessSpawnInfo> {
+    const executable = this.config.executable || "muse";
+    const sessionId = input.sessionId;
+
+    const args: string[] = [
+      "exec",
+      "--workspace",
+      input.workspaceRoot,
+      "--approval-mode",
+      "never",
+      "--yolo",
+    ];
+
+    if (sessionId) {
+      args.push("--session-id", sessionId);
+    }
+
+    if (this.config.extra_args && this.config.extra_args.length > 0) {
+      args.push(...this.config.extra_args);
+    }
+
+    args.push(input.instruction);
+
+    return {
+      command: executable,
+      args,
+      cwd: input.workspaceRoot,
+      env: input.environment,
+      sessionId,
+    };
+  }
+
+  public extractSessionId(stdout: string, stderr: string): string | undefined {
+    // Muse session ID matching if logged in output
+    const match = stdout.match(/session[- ]id[:=\s]+([a-f0-9-]{36})/i);
+    return match ? match[1] : undefined;
+  }
+}
