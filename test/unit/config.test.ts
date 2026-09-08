@@ -22,6 +22,8 @@ test("AppConfigSchema provides valid defaults", () => {
 test("loadConfig parses YAML correctly with repository definitions", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
   const configPath = path.join(tmpDir, "config.yaml");
+  const repoDir = path.join(tmpDir, "repo");
+  fs.mkdirSync(repoDir);
 
   const yamlContent = `
 server:
@@ -30,7 +32,7 @@ server:
 
 repositories:
   test-repo:
-    root: ${tmpDir}
+    root: ${repoDir}
     writable: true
     verification_profiles:
       test:
@@ -41,7 +43,7 @@ repositories:
 
   const config = loadConfig(configPath);
   assert.equal(config.server.max_concurrent_tasks, 4);
-  assert.equal(config.repositories["test-repo"].root, tmpDir);
+  assert.equal(config.repositories["test-repo"].root, repoDir);
   assert.equal(config.repositories["test-repo"].verification_profiles.test.timeout_seconds, 60);
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
