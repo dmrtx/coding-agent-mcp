@@ -8,9 +8,11 @@ import {
   AgentStartInput,
   AgentContinueInput,
   AgentProcessSpawnInfo,
+  AgentResultInterpretation,
 } from "../domain/agent.js";
 import { AgentConfig } from "../config/schema.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
+import type { ErrorCode } from "../domain/errors.js";
 
 export class AgyAdapter implements CodingAgent {
   public readonly id = "agy";
@@ -77,6 +79,13 @@ export class AgyAdapter implements CodingAgent {
         // Non-blocking chmod on non-POSIX filesystems
       }
 
+      // `read_file(.)` grants recursive reads confined to the workspace root.
+      // Per the official AGY permissions docs, rule targets match absolute
+      // paths or paths relative to workspace roots. This adapter configures
+      // exactly one trusted workspace and spawns with cwd set to it, so `.`
+      // resolves unambiguously to the assigned workspace under every
+      // documented resolution — and no operator-controlled path characters
+      // (')', whitespace, control codes) ever enter the rule string.
       const settings = {
         enableTerminalSandbox: true,
         toolPermission: "proceed-in-sandbox",
@@ -84,6 +93,7 @@ export class AgyAdapter implements CodingAgent {
         trustedWorkspaces: [workspaceRoot],
         permissions: {
           allow: [
+            "read_file(.)",
             "command(git)",
             "command(npm test)",
             "command(npm run lint)",
@@ -249,4 +259,174 @@ export class AgyAdapter implements CodingAgent {
 
     return undefined;
   }
+
+  public interpretResult(stdout: string, _stderr: string): AgentResultInterpretation {
+    // Only affirmative structured evidence in recognizable AGY result
+    // envelopes blocks. Deliberately ignores stderr, empty output, prose,
+    // unknown status keys, agent-payload JSON without envelope markers, and
+    // JSON text nested inside the model's response string (top-level keys of
+    // envelope objects are inspected; nested strings are never parsed).
+    if (!stdout || stdout.trim().length === 0) {
+      return { blocked: false };
+    }
+
+    const candidates: Record<string, unknown>[] = [];
+    const trimmed = stdout.trim();
+
+    // 1. Try full-blob JSON parse
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      collectAgyObjects(parsed, candidates);
+    } catch {
+      // Not a single JSON blob; fall through to line-delimited parsing
+    }
+
+    // 2. Try line-delimited JSON (NDJSON / stream-json)
+    for (const line of stdout.split("\n")) {
+      const lineTrimmed = line.trim();
+      if (!lineTrimmed.startsWith("{") || !lineTrimmed.endsWith("}")) continue;
+      try {
+        collectAgyObjects(JSON.parse(lineTrimmed), candidates);
+      } catch {
+        // Not JSON; ignore prose lines
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (isAgyResultEnvelope(candidate)) {
+        const evidence = findAgyDenialEvidence(candidate);
+        if (evidence) {
+          return {
+            blocked: true,
+            reason: evidence.reason,
+            details: evidence.details,
+            failureCode: evidence.failureCode,
+          };
+        }
+      }
+      // Documented stream-json terminal line: {"event":"result","result":{...}}.
+      // The inner result object carries the envelope markers and is examined
+      // on its own; nothing else is descended into.
+      if (candidate.event === "result") {
+        const inner = candidate.result;
+        if (isRecord(inner) && isAgyResultEnvelope(inner)) {
+          const evidence = findAgyDenialEvidence(inner);
+          if (evidence) {
+            return {
+              blocked: true,
+              reason: evidence.reason,
+              details: evidence.details,
+              failureCode: evidence.failureCode,
+            };
+          }
+        }
+      }
+    }
+
+    return { blocked: false };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function collectAgyObjects(parsed: unknown, out: Record<string, unknown>[]): void {
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      if (isRecord(item)) out.push(item);
+    }
+  } else if (isRecord(parsed)) {
+    out.push(parsed);
+  }
+}
+
+// Recognizably an AGY result envelope per the documented headless shapes:
+// `--output-format json` emits {conversation_id, status, ...}, and
+// stream-json terminal lines carry event:"result". Anything else — including
+// agent-payload JSON the model itself printed — is not interpreted.
+function isAgyResultEnvelope(obj: Record<string, unknown>): boolean {
+  const conversationId = obj.conversation_id ?? obj.conversationId;
+  if (typeof conversationId === "string" && conversationId.length > 0) {
+    return true;
+  }
+  return obj.event === "result";
+}
+
+const AGY_DENIED_LIST_KEYS = [
+  "denied_actions",
+  "deniedActions",
+  "denied_tools",
+  "deniedTools",
+];
+
+const AGY_STATUS_KEYS = ["status", "state", "outcome"];
+
+const AGY_DENIED_STATUSES = new Set(["denied", "blocked", "permission_denied"]);
+
+function normalizeAgyStatus(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[-\s]+/g, "_");
+}
+
+function isNonEmptyDenialList(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (typeof value === "number") return value > 0;
+  if (value !== null && typeof value === "object") {
+    return Object.keys(value as Record<string, unknown>).length > 0;
+  }
+  return false;
+}
+
+function findAgyDenialEvidence(
+  obj: Record<string, unknown>
+): { reason: string; details: Record<string, unknown>; failureCode?: ErrorCode } | undefined {
+  // Non-empty denied action/tool lists: unambiguous permission denial.
+  for (const key of AGY_DENIED_LIST_KEYS) {
+    if (key in obj && isNonEmptyDenialList(obj[key])) {
+      return {
+        reason: `AGY run reported non-empty '${key}'`,
+        details: { key, value: obj[key] },
+      };
+    }
+  }
+
+  // Structured terminal status indicating denial (not a generic error).
+  for (const key of AGY_STATUS_KEYS) {
+    const value = obj[key];
+    if (typeof value === "string" && AGY_DENIED_STATUSES.has(normalizeAgyStatus(value))) {
+      return {
+        reason: `AGY run reported structured status '${value}'`,
+        details: { key, value },
+      };
+    }
+  }
+
+  // Explicit numeric denied/permission-denied counts > 0.
+  for (const [key, value] of Object.entries(obj)) {
+    if (typeof value === "number" && value > 0 && key.toLowerCase().includes("denied")) {
+      return {
+        reason: `AGY run reported denied count '${key}' = ${value}`,
+        details: { key, value },
+      };
+    }
+  }
+
+  // A bare envelope ERROR status without any denial-specific evidence is a
+  // genuine failure, but it must not be mislabeled as a policy denial.
+  for (const key of AGY_STATUS_KEYS) {
+    const value = obj[key];
+    if (typeof value === "string" && normalizeAgyStatus(value) === "error") {
+      return {
+        reason: `AGY run reported structured status '${value}' without denial evidence`,
+        details: { key, value },
+        failureCode: ErrorCodes.INTERNAL_ERROR,
+      };
+    }
+  }
+
+  return undefined;
 }
