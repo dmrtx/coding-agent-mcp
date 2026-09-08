@@ -821,7 +821,7 @@ export class AgyAcpAdapter implements CodingAgent {
           if (activeTurn) activeTurn.sessionId = sessionId;
           const answer = (await client.sessionPrompt({
             sessionId,
-            prompt,
+            prompt: [{ type: "text", text: prompt }],
           })) as Record<string, unknown>;
           const rawStopReason = answer.stopReason;
           const stopReason =
