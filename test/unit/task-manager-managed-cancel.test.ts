@@ -213,19 +213,34 @@ function completedStartResult(sessionId: string): ManagedStartResult {
   };
 }
 
+async function waitForTerminal(
+  taskManager: import("../../src/orchestration/task-manager.js").TaskManager,
+  taskId: string,
+  timeoutMs = 8000
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const task = taskManager.getTask(taskId);
+    if (task.status !== "running" && task.status !== "starting") return task;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for terminal ${taskId}`);
+    await sleep(10);
+  }
+}
+
 test("acknowledged managed cancel skips ProcessManager and survives late managed completion", async () => {
   const env = setupEnv();
   const stub = new ControllableManagedAgent();
   env.agentRegistry.registerAgent(stub);
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: stub.id,
       instruction: "long work",
       mode: "implement",
     });
+    assert.equal(started.status, "running");
     await waitFor(() => stub.startCalls.length === 1);
-    const taskId = stub.startCalls[0].taskId;
+    const taskId = started.task_id;
 
     const cancelled = await env.taskManager.cancelTask(taskId);
     assert.deepEqual(cancelled, { task_id: taskId, cancelled: true });
@@ -252,8 +267,8 @@ test("acknowledged managed cancel skips ProcessManager and survives late managed
 
     // Late natural completion must not overwrite the terminal state.
     stub.resolveNextStart(completedStartResult("sess-cancel-1"));
-    const settled = await startPromise;
-    assert.equal(settled.status, "cancelled");
+    await waitForTerminal(env.taskManager, taskId);
+    await sleep(50);
 
     task = env.taskManager.getTask(taskId);
     assert.equal(task.status, "cancelled");
@@ -272,14 +287,15 @@ test("fallback managed cancel routes through ProcessManager.cancelProcess", asyn
   stub.cancelBehavior = { kind: "fallback" };
   env.agentRegistry.registerAgent(stub);
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: stub.id,
       instruction: "long work",
       mode: "implement",
     });
+    assert.equal(started.status, "running");
     await waitFor(() => stub.startCalls.length === 1);
-    const taskId = stub.startCalls[0].taskId;
+    const taskId = started.task_id;
 
     // No ProcessManager worker exists for a managed run: cancelProcess
     // returns false, but the task still settles cancelled safely.
@@ -293,8 +309,8 @@ test("fallback managed cancel routes through ProcessManager.cancelProcess", asyn
     assert.equal(task.failure?.code, "TASK_CANCELLED");
 
     stub.resolveNextStart(completedStartResult("sess-cancel-1"));
-    const settled = await startPromise;
-    assert.equal(settled.status, "cancelled");
+    await waitForTerminal(env.taskManager, taskId);
+    await sleep(50);
 
     const audits = env.readAudits().filter((e) => e.taskId === taskId);
     assert.equal(audits.filter((e) => e.type === "task.cancelled").length, 1);
@@ -310,14 +326,15 @@ test("throwing managed cancel hook falls back without surfacing INTERNAL_ERROR",
   stub.cancelBehavior = { kind: "throw" };
   env.agentRegistry.registerAgent(stub);
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: stub.id,
       instruction: "long work",
       mode: "implement",
     });
+    assert.equal(started.status, "running");
     await waitFor(() => stub.startCalls.length === 1);
-    const taskId = stub.startCalls[0].taskId;
+    const taskId = started.task_id;
 
     // The hook throw must not propagate: same fallback as an explicit
     // fallback result, and no worker means cancelled:false.
@@ -332,8 +349,8 @@ test("throwing managed cancel hook falls back without surfacing INTERNAL_ERROR",
     assert.notEqual(task.failure?.code, "INTERNAL_ERROR");
 
     stub.resolveNextStart(completedStartResult("sess-cancel-1"));
-    const settled = await startPromise;
-    assert.equal(settled.status, "cancelled");
+    await waitForTerminal(env.taskManager, taskId);
+    await sleep(50);
   } finally {
     env.cleanup();
   }
@@ -344,21 +361,22 @@ test("repeat cancel after terminal state keeps the TASK_NOT_RUNNING contract", a
   const stub = new ControllableManagedAgent();
   env.agentRegistry.registerAgent(stub);
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: stub.id,
       instruction: "long work",
       mode: "implement",
     });
+    assert.equal(started.status, "running");
     await waitFor(() => stub.startCalls.length === 1);
-    const taskId = stub.startCalls[0].taskId;
+    const taskId = started.task_id;
 
     const cancelled = await env.taskManager.cancelTask(taskId);
     assert.deepEqual(cancelled, { task_id: taskId, cancelled: true });
 
     stub.resolveNextStart(completedStartResult("sess-cancel-1"));
-    const settled = await startPromise;
-    assert.equal(settled.status, "cancelled");
+    await waitForTerminal(env.taskManager, taskId);
+    await sleep(50);
 
     const auditsBefore = env.readAudits().filter((e) => e.taskId === taskId);
 
@@ -386,14 +404,15 @@ test("managed run finally owns slot cleanup: cancel must not release it early", 
   const stub = new ControllableManagedAgent();
   env.agentRegistry.registerAgent(stub);
   try {
-    const startPromiseA = env.taskManager.startTask({
+    const startedA = await env.taskManager.startTask({
       repository: "test-repo",
       agent: stub.id,
       instruction: "task A",
       mode: "implement",
     });
+    assert.equal(startedA.status, "running");
     await waitFor(() => stub.startCalls.length === 1);
-    const taskIdA = stub.startCalls[0].taskId;
+    const taskIdA = startedA.task_id;
 
     const cancelled = await env.taskManager.cancelTask(taskIdA);
     assert.deepEqual(cancelled, { task_id: taskIdA, cancelled: true });
@@ -414,19 +433,23 @@ test("managed run finally owns slot cleanup: cancel must not release it early", 
     // Once the managed run finally settles, the slot is released exactly once
     // and the terminal state is preserved.
     stub.resolveNextStart(completedStartResult("sess-A"));
-    const settledA = await startPromiseA;
-    assert.equal(settledA.status, "cancelled");
+    const terminalA = await waitForTerminal(env.taskManager, taskIdA);
+    assert.equal(terminalA.status, "cancelled");
+    // Terminal was already cancelled by cancelTask; wait for the background
+    // settlement to release the slot before starting the next task.
+    await waitFor(() => env.processManager.getRunningProcessCount() === 0);
 
-    const startPromiseB = env.taskManager.startTask({
+    const startedB = await env.taskManager.startTask({
       repository: "test-repo",
       agent: stub.id,
       instruction: "task B",
       mode: "implement",
     });
+    assert.equal(startedB.status, "running");
     await waitFor(() => stub.startCalls.length === 2);
     stub.resolveNextStart(completedStartResult("sess-B"));
-    const startedB = await startPromiseB;
-    assert.equal(startedB.status, "completed");
+    const terminalB = await waitForTerminal(env.taskManager, startedB.task_id);
+    assert.equal(terminalB.status, "completed");
 
     // A late operation on A is terminal-only: it never re-enters the hook,
     // so the settled run is no longer treated as in flight.
@@ -477,16 +500,17 @@ test("cancellation during managed continue invokes the hook and survives late co
   const stub = new ControllableManagedAgent();
   env.agentRegistry.registerAgent(stub);
   try {
-    const startPromise = env.taskManager.startTask({
+    const started = await env.taskManager.startTask({
       repository: "test-repo",
       agent: stub.id,
       instruction: "initial work",
       mode: "implement",
     });
+    assert.equal(started.status, "running");
     await waitFor(() => stub.startCalls.length === 1);
     stub.resolveNextStart(completedStartResult("sess-cancel-1"));
-    const started = await startPromise;
-    assert.equal(started.status, "completed");
+    const terminalStart = await waitForTerminal(env.taskManager, started.task_id);
+    assert.equal(terminalStart.status, "completed");
 
     const continuePromise = env.taskManager.continueTask({
       task_id: started.task_id,

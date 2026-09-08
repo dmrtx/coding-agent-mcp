@@ -153,6 +153,20 @@ function readTrace(homeDir: string): Array<{ pid: number; method: string }> {
     .map((l) => JSON.parse(l));
 }
 
+async function waitForTerminal(
+  taskManager: import("../../src/orchestration/task-manager.js").TaskManager,
+  taskId: string,
+  timeoutMs = 30000
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const task = taskManager.getTask(taskId);
+    if (task.status !== "running" && task.status !== "starting") return task;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for terminal ${taskId}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 async function startImplement(env: ReturnType<typeof setupEnv>, instruction: string, mode = "implement") {
   const started = await env.taskManager.startTask({
     repository: "test-repo",
@@ -160,7 +174,9 @@ async function startImplement(env: ReturnType<typeof setupEnv>, instruction: str
     instruction,
     mode: mode as "implement",
   });
-  assert.equal(started.status, "completed");
+  assert.equal(started.status, "running");
+  const terminal = await waitForTerminal(env.taskManager, started.task_id);
+  assert.equal(terminal.status, "completed");
   return started;
 }
 

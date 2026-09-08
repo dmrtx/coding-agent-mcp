@@ -53,6 +53,7 @@ export class TaskManager {
   private readonly taskStore: TaskStore;
   private readonly auditStore: AuditStore;
   private readonly inFlightManagedRuns = new Set<string>();
+  private readonly managedStartSettlements = new Map<string, Promise<void>>();
 
   constructor(
     config: AppConfig,
@@ -143,7 +144,26 @@ export class TaskManager {
         (agentConfig?.default_timeout_seconds ?? this.config.server.default_task_timeout_seconds) * 1000;
 
       if (typeof agent.runManagedStart === "function") {
-        return await this.runManagedStartTask(task, agent, {
+        // Asynchronous/non-blocking managed start (process-backed parity):
+        // persist running state synchronously, then settle the managed turn
+        // in a detached-but-supervised promise owned by TaskManager. This
+        // keeps start_task responsive for long AGY turns so the caller
+        // receives task_id before the MCP tool-call timeout.
+        if (task.workspaceStrategy === "in_place") {
+          task.sessionResumable = false;
+        }
+        task.startedAt = new Date().toISOString();
+        task.status = "running";
+        this.taskStore.saveTask(task);
+        this.auditStore.append({
+          type: "task.started",
+          taskId: task.id,
+          agentId: params.agent,
+          details: { managed: true, mode },
+        });
+        const writer = this.createManagedOutputWriter(task, params.agent);
+        this.inFlightManagedRuns.add(task.id);
+        const settlement = this.settleManagedStart(task, agent, {
           repositoryRoot: repoConfig.root,
           instruction: params.instruction,
           mode,
@@ -151,7 +171,14 @@ export class TaskManager {
           timeoutMs,
           repository: params.repository,
           agentId: params.agent,
-        });
+        }, writer, workspace);
+        this.trackManagedSettlement(task.id, settlement);
+        return {
+          task_id: taskId,
+          status: task.status,
+          agent: params.agent,
+          repository: params.repository,
+        };
       }
 
       const spawnInfo = await agent.prepareStart({
@@ -739,7 +766,21 @@ export class TaskManager {
     return "completed";
   }
 
-  private async runManagedStartTask(
+  private trackManagedSettlement(taskId: string, settlement: Promise<void>): void {
+    this.managedStartSettlements.set(taskId, settlement);
+    // Supervised detachment: swallow here to avoid unhandled rejections.
+    // The settlement itself persists terminal state; this handler only
+    // guarantees the rejection is observed and the registry is cleaned.
+    settlement.catch(() => {
+      // Intentionally ignored: terminal persistence already attempted inside.
+    }).finally(() => {
+      if (this.managedStartSettlements.get(taskId) === settlement) {
+        this.managedStartSettlements.delete(taskId);
+      }
+    });
+  }
+
+  private async settleManagedStart(
     task: CodingTask,
     agent: CodingAgent,
     opts: {
@@ -750,33 +791,13 @@ export class TaskManager {
       timeoutMs: number;
       repository: string;
       agentId: string;
-    }
-  ): Promise<{
-    task_id: string;
-    status: TaskStatus;
-    agent: string;
-    repository: string;
-  }> {
-    if (task.workspaceStrategy === "in_place") {
-      task.sessionResumable = false;
-    }
-    task.startedAt = new Date().toISOString();
-    task.status = "running";
-    this.taskStore.saveTask(task);
-
-    this.auditStore.append({
-      type: "task.started",
-      taskId: task.id,
-      agentId: opts.agentId,
-      details: { managed: true, mode: opts.mode },
-    });
-
-    const writer = this.createManagedOutputWriter(task, opts.agentId);
-
-    // Exceptions propagate to the startTask catch block, which performs
-    // the legacy startup-failure path (slot release, workspace cleanup,
-    // failed persistence). Structured results below return without throwing.
-    this.inFlightManagedRuns.add(task.id);
+    },
+    writer: { write: (text: string, isStderr?: boolean) => void },
+    workspace: WorkspaceDescriptor | undefined
+  ): Promise<void> {
+    // Hook throw settles asynchronously (no caller to rethrow to): map to a
+    // typed failure without overwriting a raced terminal state. Structured
+    // results below settle without throwing.
     let result: ManagedStartResult;
     try {
       result = await agent.runManagedStart!({
@@ -791,9 +812,63 @@ export class TaskManager {
           writer.write(text, isStderr ?? false);
         },
       });
-    } finally {
+    } catch (err) {
       this.inFlightManagedRuns.delete(task.id);
+      let storedAfterThrow: CodingTask | null = null;
+      try {
+        storedAfterThrow = this.taskStore.getTask(task.id);
+      } catch {
+        storedAfterThrow = null;
+      }
+      if (
+        storedAfterThrow &&
+        storedAfterThrow.status !== "running" &&
+        storedAfterThrow.status !== "starting"
+      ) {
+        try {
+          this.processManager.releaseSlot(task.id);
+        } catch {
+          // Non-blocking slot release
+        }
+        return;
+      }
+      // Preserve legacy startup-failure cleanup for hook throws.
+      if (workspace) {
+        try {
+          await this.workspaceManager.cleanupWorkspace(task.id);
+        } catch {
+          // Non-blocking cleanup
+        }
+      }
+      task.status = "failed";
+      task.finishedAt = new Date().toISOString();
+      task.failure = {
+        code: err instanceof CodingAgentError ? err.code : ErrorCodes.PROCESS_START_FAILED,
+        message: err instanceof Error ? err.message : String(err),
+      };
+      try {
+        this.taskStore.saveTask(task);
+      } catch {
+        // Non-blocking persistence
+      }
+      try {
+        this.auditStore.append({
+          type: "task.failed",
+          taskId: task.id,
+          agentId: opts.agentId,
+          details: { managed: true, code: task.failure.code },
+        });
+      } catch {
+        // Non-blocking audit
+      }
+      try {
+        this.processManager.releaseSlot(task.id);
+      } catch {
+        // Non-blocking slot release
+      }
+      return;
     }
+    this.inFlightManagedRuns.delete(task.id);
 
     // Guard against an external settle (e.g. cancelTask) racing the await:
     // never overwrite a terminal state or emit a second terminal audit.
@@ -803,137 +878,138 @@ export class TaskManager {
       stored.status !== "running" &&
       stored.status !== "starting"
     ) {
-      this.processManager.releaseSlot(task.id);
-      return {
-        task_id: task.id,
-        status: stored.status,
-        agent: opts.agentId,
-        repository: opts.repository,
-      };
+      try {
+        this.processManager.releaseSlot(task.id);
+      } catch {
+        // Non-blocking slot release
+      }
+      return;
     }
 
-    if (typeof result.assistantText === "string" && result.assistantText.length > 0) {
-      writer.write(result.assistantText, false);
-    }
-    if (Array.isArray(result.outputLines)) {
-      for (const line of result.outputLines) {
-        if (typeof line === "string" && line.length > 0) {
-          writer.write(line, false);
+    try {
+      if (typeof result.assistantText === "string" && result.assistantText.length > 0) {
+        writer.write(result.assistantText, false);
+      }
+      if (Array.isArray(result.outputLines)) {
+        for (const line of result.outputLines) {
+          if (typeof line === "string" && line.length > 0) {
+            writer.write(line, false);
+          }
         }
       }
-    }
 
-    if (task.workspaceStrategy !== "in_place") {
-      if (typeof result.sessionId === "string" && result.sessionId.length > 0) {
-        task.sessionId = result.sessionId;
-        task.sessionResumable =
-          typeof result.sessionResumable === "boolean"
-            ? result.sessionResumable
-            : true;
-      } else if (typeof result.sessionResumable === "boolean") {
-        task.sessionResumable = result.sessionResumable;
+      if (task.workspaceStrategy !== "in_place") {
+        if (typeof result.sessionId === "string" && result.sessionId.length > 0) {
+          task.sessionId = result.sessionId;
+          task.sessionResumable =
+            typeof result.sessionResumable === "boolean"
+              ? result.sessionResumable
+              : true;
+        } else if (typeof result.sessionResumable === "boolean") {
+          task.sessionResumable = result.sessionResumable;
+        }
+      } else {
+        task.sessionResumable = false;
       }
-    } else {
-      task.sessionResumable = false;
-    }
 
-    const finalStatus = this.resolveManagedStatus(result);
-    task.finishedAt = new Date().toISOString();
+      const finalStatus = this.resolveManagedStatus(result);
+      task.finishedAt = new Date().toISOString();
 
-    if (task.workspaceStrategy === "in_place") {
+      if (task.workspaceStrategy === "in_place") {
+        try {
+          await this.workspaceManager.cleanupWorkspace(task.id);
+        } catch {
+          // Non-blocking cleanup
+        }
+      }
+
+      if (finalStatus === "completed") {
+        task.status = "completed";
+        task.exitCode = 0;
+        task.failure = undefined;
+        this.taskStore.saveTask(task);
+        this.auditStore.append({
+          type: "task.completed",
+          taskId: task.id,
+          agentId: opts.agentId,
+          details: {
+            managed: true,
+            ...(typeof result.stopReason === "string"
+              ? { stopReason: result.stopReason }
+              : {}),
+          },
+        });
+      } else if (finalStatus === "cancelled") {
+        task.status = "cancelled";
+        task.failure = {
+          code: String(result.failureCode ?? ErrorCodes.TASK_CANCELLED),
+          message: result.failureMessage ?? "Managed agent run was cancelled",
+          ...(result.failureDetails !== undefined
+            ? { details: result.failureDetails }
+            : result.stopReason !== undefined
+              ? { details: { stopReason: result.stopReason } }
+              : {}),
+        };
+        this.taskStore.saveTask(task);
+        this.auditStore.append({
+          type: "task.cancelled",
+          taskId: task.id,
+          agentId: opts.agentId,
+          details: { managed: true },
+        });
+      } else if (finalStatus === "timed_out") {
+        task.status = "timed_out";
+        task.failure = {
+          code: String(result.failureCode ?? ErrorCodes.TASK_TIMEOUT),
+          message: result.failureMessage ?? "Managed agent run timed out",
+          ...(result.failureDetails !== undefined
+            ? { details: result.failureDetails }
+            : result.stopReason !== undefined
+              ? { details: { stopReason: result.stopReason } }
+              : {}),
+        };
+        this.taskStore.saveTask(task);
+        this.auditStore.append({
+          type: "task.timed_out",
+          taskId: task.id,
+          agentId: opts.agentId,
+          details: { managed: true },
+        });
+      } else {
+        task.status = "failed";
+        task.failure = {
+          code: String(result.failureCode ?? ErrorCodes.INTERNAL_ERROR),
+          message: result.failureMessage ?? "Managed agent run failed",
+          ...(result.failureDetails !== undefined
+            ? { details: result.failureDetails }
+            : result.stopReason !== undefined
+              ? { details: { stopReason: result.stopReason } }
+              : {}),
+        };
+        this.taskStore.saveTask(task);
+        this.auditStore.append({
+          type: "task.failed",
+          taskId: task.id,
+          agentId: opts.agentId,
+          details: {
+            managed: true,
+            code: task.failure.code,
+            ...(typeof result.stopReason === "string"
+              ? { stopReason: result.stopReason }
+              : {}),
+          },
+        });
+      }
+    } catch {
+      // Settlement persistence must never escape as unhandled rejection.
+      // Slot release below still runs; terminal state may already be partial.
+    } finally {
       try {
-        await this.workspaceManager.cleanupWorkspace(task.id);
+        this.processManager.releaseSlot(task.id);
       } catch {
-        // Non-blocking cleanup
+        // Non-blocking slot release
       }
     }
-
-    if (finalStatus === "completed") {
-      task.status = "completed";
-      task.exitCode = 0;
-      task.failure = undefined;
-      this.taskStore.saveTask(task);
-      this.auditStore.append({
-        type: "task.completed",
-        taskId: task.id,
-        agentId: opts.agentId,
-        details: {
-          managed: true,
-          ...(typeof result.stopReason === "string"
-            ? { stopReason: result.stopReason }
-            : {}),
-        },
-      });
-    } else if (finalStatus === "cancelled") {
-      task.status = "cancelled";
-      task.failure = {
-        code: String(result.failureCode ?? ErrorCodes.TASK_CANCELLED),
-        message: result.failureMessage ?? "Managed agent run was cancelled",
-        ...(result.failureDetails !== undefined
-          ? { details: result.failureDetails }
-          : result.stopReason !== undefined
-            ? { details: { stopReason: result.stopReason } }
-            : {}),
-      };
-      this.taskStore.saveTask(task);
-      this.auditStore.append({
-        type: "task.cancelled",
-        taskId: task.id,
-        agentId: opts.agentId,
-        details: { managed: true },
-      });
-    } else if (finalStatus === "timed_out") {
-      task.status = "timed_out";
-      task.failure = {
-        code: String(result.failureCode ?? ErrorCodes.TASK_TIMEOUT),
-        message: result.failureMessage ?? "Managed agent run timed out",
-        ...(result.failureDetails !== undefined
-          ? { details: result.failureDetails }
-          : result.stopReason !== undefined
-            ? { details: { stopReason: result.stopReason } }
-            : {}),
-      };
-      this.taskStore.saveTask(task);
-      this.auditStore.append({
-        type: "task.timed_out",
-        taskId: task.id,
-        agentId: opts.agentId,
-        details: { managed: true },
-      });
-    } else {
-      task.status = "failed";
-      task.failure = {
-        code: String(result.failureCode ?? ErrorCodes.INTERNAL_ERROR),
-        message: result.failureMessage ?? "Managed agent run failed",
-        ...(result.failureDetails !== undefined
-          ? { details: result.failureDetails }
-          : result.stopReason !== undefined
-            ? { details: { stopReason: result.stopReason } }
-            : {}),
-      };
-      this.taskStore.saveTask(task);
-      this.auditStore.append({
-        type: "task.failed",
-        taskId: task.id,
-        agentId: opts.agentId,
-        details: {
-          managed: true,
-          code: task.failure.code,
-          ...(typeof result.stopReason === "string"
-            ? { stopReason: result.stopReason }
-            : {}),
-        },
-      });
-    }
-
-    this.processManager.releaseSlot(task.id);
-
-    return {
-      task_id: task.id,
-      status: task.status,
-      agent: opts.agentId,
-      repository: opts.repository,
-    };
   }
 
   private async runManagedContinueTask(
