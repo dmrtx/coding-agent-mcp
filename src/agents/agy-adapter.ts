@@ -16,9 +16,11 @@ export class AgyAdapter implements CodingAgent {
   public readonly id = "agy";
   public readonly displayName = "AGY";
   private readonly config: AgentConfig;
+  private readonly dataDir?: string;
 
-  constructor(config: AgentConfig) {
+  constructor(config: AgentConfig, dataDir?: string) {
     this.config = config;
+    this.dataDir = dataDir;
   }
 
   public async describe(): Promise<AgentDescriptor> {
@@ -57,11 +59,23 @@ export class AgyAdapter implements CodingAgent {
     };
   }
 
-  private setupAgySettings(workspaceRoot: string, baseEnv: Record<string, string>): Record<string, string> {
+  private setupAgySettings(
+    taskId: string,
+    workspaceRoot: string,
+    baseEnv: Record<string, string>
+  ): Record<string, string> {
     try {
-      const configDir = path.join(workspaceRoot, ".gemini-config");
+      const dataDir = this.dataDir || path.join(os.tmpdir(), "coding-agent-mcp");
+      const configDir = path.join(dataDir, "agent-homes", "agy", taskId);
       const agyCliDir = path.join(configDir, ".gemini", "antigravity-cli");
-      fs.mkdirSync(agyCliDir, { recursive: true });
+      fs.mkdirSync(agyCliDir, { recursive: true, mode: 0o700 });
+      try {
+        fs.chmodSync(configDir, 0o700);
+        fs.chmodSync(path.join(configDir, ".gemini"), 0o700);
+        fs.chmodSync(agyCliDir, 0o700);
+      } catch {
+        // Non-blocking chmod on non-POSIX filesystems
+      }
 
       const settings = {
         enableTerminalSandbox: true,
@@ -81,25 +95,42 @@ export class AgyAdapter implements CodingAgent {
         },
       };
 
+      const settingsPath = path.join(agyCliDir, "settings.json");
       fs.writeFileSync(
-        path.join(agyCliDir, "settings.json"),
+        settingsPath,
         JSON.stringify(settings, null, 2),
-        "utf-8"
+        { encoding: "utf-8", mode: 0o600 }
       );
+      try {
+        fs.chmodSync(settingsPath, 0o600);
+      } catch {
+        // Non-blocking
+      }
 
       // Copy authentication token from host if available
       const userHome = process.env.HOME || os.homedir();
       const hostToken = path.join(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
       if (fs.existsSync(hostToken)) {
-        fs.copyFileSync(hostToken, path.join(agyCliDir, "antigravity-oauth-token"));
+        const destToken = path.join(agyCliDir, "antigravity-oauth-token");
+        fs.copyFileSync(hostToken, destToken);
+        try {
+          fs.chmodSync(destToken, 0o600);
+        } catch {
+          // Non-blocking
+        }
       }
 
       return {
         ...baseEnv,
         HOME: configDir,
       };
-    } catch {
-      return baseEnv;
+    } catch (err: any) {
+      // Fail-closed: Never fall back to host HOME
+      throw new CodingAgentError(
+        ErrorCodes.POLICY_DENIED,
+        `Failed to initialize secure isolated AGY configuration for task '${taskId}': ${err.message}`,
+        { taskId, workspaceRoot, error: err.message }
+      );
     }
   }
 
@@ -107,7 +138,7 @@ export class AgyAdapter implements CodingAgent {
     const executable = this.config.executable || "agy";
 
     // Setup strict bounded permissions configuration (no --dangerously-skip-permissions)
-    const env = this.setupAgySettings(input.workspaceRoot, input.environment);
+    const env = this.setupAgySettings(input.taskId, input.workspaceRoot, input.environment);
 
     const args: string[] = [
       "--print",
@@ -147,7 +178,7 @@ export class AgyAdapter implements CodingAgent {
 
     const executable = this.config.executable || "agy";
 
-    const env = this.setupAgySettings(input.workspaceRoot, input.environment);
+    const env = this.setupAgySettings(input.taskId, input.workspaceRoot, input.environment);
 
     const args: string[] = [
       "--print",

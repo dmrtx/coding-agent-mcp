@@ -4,7 +4,109 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { ProcessManager } from "../../src/orchestration/process-manager.js";
+import { ProcessManager, getProcessStartTime, getProcessCwd } from "../../src/orchestration/process-manager.js";
+
+test("ProcessManager safely recovers verifiable orphaned workers on startup", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-recovery-test-"));
+  const pm = new ProcessManager(1000, tmpDir);
+
+  // Spawn a real long-running worker process
+  const worker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+    cwd: tmpDir,
+    detached: true,
+    stdio: "ignore",
+  });
+  const workerPid = worker.pid!;
+  const osStartTime = getProcessStartTime(workerPid) || undefined;
+  const workerCwd = getProcessCwd(workerPid) || tmpDir;
+
+  // Write verifiable identity as if left behind by a hard crash
+  const identityFile = path.join(tmpDir, "active-workers.json");
+  fs.writeFileSync(
+    identityFile,
+    JSON.stringify([
+      {
+        taskId: "task-orphaned-1",
+        pid: workerPid,
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => {}, 60000)"],
+        cwd: workerCwd,
+        startedAt: Date.now(),
+        osStartTime,
+      },
+    ])
+  );
+
+  // Startup recovery
+  const recovered = await pm.recoverOrphanedWorkers();
+  assert.equal(recovered, 1);
+
+  // Verify worker is dead
+  let alive = true;
+  try {
+    process.kill(workerPid, 0);
+  } catch {
+    alive = false;
+  }
+  assert.equal(alive, false, "Orphaned worker must be terminated");
+  assert.equal(fs.existsSync(identityFile), false, "active-workers.json must be removed after successful recovery");
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("ProcessManager skips unverified workers and retains them in active-workers.json", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-unverified-test-"));
+  const pm = new ProcessManager(1000, tmpDir);
+
+  // Spawn an active worker
+  const worker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+    cwd: tmpDir,
+    detached: true,
+    stdio: "ignore",
+  });
+  const workerPid = worker.pid!;
+
+  try {
+    const identityFile = path.join(tmpDir, "active-workers.json");
+    // Identity is missing osStartTime -> cannot be verified
+    fs.writeFileSync(
+      identityFile,
+      JSON.stringify([
+        {
+          taskId: "task-unverified-1",
+          pid: workerPid,
+          command: process.execPath,
+          args: ["-e", "setTimeout(() => {}, 60000)"],
+          cwd: tmpDir,
+          startedAt: Date.now(),
+        },
+      ])
+    );
+
+    const recovered = await pm.recoverOrphanedWorkers();
+    assert.equal(recovered, 0, "Unverified worker must NOT be killed");
+
+    // Verify worker is still running
+    let alive = true;
+    try {
+      process.kill(workerPid, 0);
+    } catch {
+      alive = false;
+    }
+    assert.equal(alive, true, "Worker process must still be running");
+
+    // Verify active-workers.json retains the unverified entry
+    assert.equal(fs.existsSync(identityFile), true, "active-workers.json must NOT be deleted");
+    const retained = JSON.parse(fs.readFileSync(identityFile, "utf-8"));
+    assert.equal(retained.length, 1);
+    assert.equal(retained[0].taskId, "task-unverified-1");
+  } finally {
+    try {
+      process.kill(workerPid, "SIGKILL");
+    } catch {}
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
 
 test("ProcessManager shutdown terminates all active worker process groups", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-shutdown-test-"));
@@ -181,49 +283,6 @@ test("ProcessManager enforces cumulative per-task output cap across continuation
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("ProcessManager safely recovers verifiable orphaned workers on startup", async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-recovery-test-"));
-  const pm = new ProcessManager(1000, tmpDir);
-
-  // Spawn a real long-running worker process
-  const worker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
-    cwd: tmpDir,
-    detached: true,
-    stdio: "ignore",
-  });
-  const workerPid = worker.pid!;
-
-  // Write verifiable identity as if left behind by a hard crash
-  const identityFile = path.join(tmpDir, "active-workers.json");
-  fs.writeFileSync(
-    identityFile,
-    JSON.stringify([
-      {
-        taskId: "task-orphaned-1",
-        pid: workerPid,
-        command: process.execPath,
-        args: ["-e", "setTimeout(() => {}, 60000)"],
-        cwd: tmpDir,
-        startedAt: Date.now(),
-      },
-    ])
-  );
-
-  // Startup recovery
-  const recovered = await pm.recoverOrphanedWorkers();
-  assert.equal(recovered, 1);
-
-  // Verify worker is dead
-  let alive = true;
-  try {
-    process.kill(workerPid, 0);
-  } catch {
-    alive = false;
-  }
-  assert.equal(alive, false, "Orphaned worker must be terminated");
-
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-});
 
 test("ProcessManager does NOT kill recycled PID with same binary but different start time or cwd", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-recycled-test-"));

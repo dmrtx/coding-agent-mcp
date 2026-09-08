@@ -12,7 +12,7 @@ export class AgentRegistry {
       this.registerAgent(new MuseAdapter(config.agents.muse));
     }
     if (config.agents.agy) {
-      this.registerAgent(new AgyAdapter(config.agents.agy));
+      this.registerAgent(new AgyAdapter(config.agents.agy, config.server?.data_dir));
     }
   }
 

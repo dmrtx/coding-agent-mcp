@@ -38,12 +38,14 @@
   (executed with working directory set to the task workspace).
 - Notice:
   - `--dangerously-skip-permissions` is strictly **omitted**.
-  - Instead, the adapter sets up an isolated environment with `HOME` pointing to `<workspaceRoot>/.gemini-config` containing `.gemini/antigravity-cli/settings.json`:
+  - Instead, the adapter sets up an isolated environment with `HOME` pointing to `<server.data_dir>/agent-homes/agy/<task-id>` (strictly outside the workspace root with `0700` directory permissions and `0600` for credentials and settings):
     - `enableTerminalSandbox: true`
     - `toolPermission: "proceed-in-sandbox"` (auto-proceeds within the sandbox)
     - `allowNonWorkspaceAccess: false` (strictly blocks reading or writing outside the workspace)
     - `trustedWorkspaces: [<workspaceRoot>]`
     - Granular permissions allowlist for safe build and test commands (`git`, `npm test`, `npm run lint`, etc.).
+  - **Fail-closed configuration**: If the isolated directory cannot be created, task execution rejects immediately with `POLICY_DENIED`. It never falls back to the host `HOME` or host credentials.
+  - **Clean workspace**: Because the configuration lives under `agent-homes/agy/<task-id>`, credentials and configuration files never pollute the task workspace or leak in `get_repo_status` / `get_diff`.
   - `--sandbox` is explicitly enabled.
   - `--output-format json` emits structured output from which the real `conversation_id` is parsed and stored.
   - If `mode` is `review` or `investigate`, `--mode plan` is added.

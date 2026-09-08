@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execSync } from "node:child_process";
 import { MuseAdapter } from "../../src/agents/muse-adapter.js";
 import { AgyAdapter } from "../../src/agents/agy-adapter.js";
 import { AgentRegistry } from "../../src/agents/agent-registry.js";
+import { GitService } from "../../src/repositories/git-service.js";
 import { AppConfigSchema } from "../../src/config/schema.js";
 
 test("MuseAdapter constructs safe headless arguments without --yolo", async () => {
@@ -99,7 +101,10 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
     assert.equal(spawnInfo.sessionId, undefined);
 
     // Check isolated environment settings
-    assert.ok(spawnInfo.env.HOME?.includes(".gemini-config"));
+    assert.ok(spawnInfo.env.HOME?.includes(path.join("agent-homes", "agy", "task-test-agy")));
+    assert.equal(fs.existsSync(path.join(tmpWorkspace, ".gemini-config")), false, "No config inside workspace root");
+    assert.equal(fs.existsSync(path.join(tmpWorkspace, ".gemini")), false, "No .gemini inside workspace root");
+
     const settingsFile = path.join(spawnInfo.env.HOME!, ".gemini", "antigravity-cli", "settings.json");
     assert.ok(fs.existsSync(settingsFile), "settings.json must be created in isolated AGY HOME");
     const settings = JSON.parse(fs.readFileSync(settingsFile, "utf-8"));
@@ -107,6 +112,12 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
     assert.equal(settings.toolPermission, "proceed-in-sandbox");
     assert.equal(settings.allowNonWorkspaceAccess, false);
     assert.deepEqual(settings.trustedWorkspaces, [tmpWorkspace]);
+
+    // Permissions: 0700 for dir, 0600 for settings file
+    const homeStat = fs.statSync(spawnInfo.env.HOME!);
+    assert.equal(homeStat.mode & 0o777, 0o700, "Isolated AGY HOME must have 0700 permissions");
+    const settingsStat = fs.statSync(settingsFile);
+    assert.equal(settingsStat.mode & 0o777, 0o600, "settings.json must have 0600 permissions");
 
     // Review mode uses plan
     const reviewSpawn = await adapter.prepareStart({
@@ -216,3 +227,112 @@ test("AgentRegistry blocks disabled and unavailable agents", async () => {
     (err: any) => err.code === "AGENT_NOT_AVAILABLE"
   );
 });
+
+test("AgyAdapter isolates auth token outside workspace and keeps workspace git tree clean", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "agy-auth-test-"));
+  const mockHome = path.join(tmpBase, "mock-home");
+  const hostTokenDir = path.join(mockHome, ".gemini", "antigravity-cli");
+  fs.mkdirSync(hostTokenDir, { recursive: true });
+  const sentinelToken = "SUPER_SECRET_SENTINEL_TOKEN_12345";
+  fs.writeFileSync(path.join(hostTokenDir, "antigravity-oauth-token"), sentinelToken, "utf-8");
+
+  const repoDir = path.join(tmpBase, "repo");
+  fs.mkdirSync(repoDir);
+  execSync("git init -b main", { cwd: repoDir, stdio: "ignore" });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir, stdio: "ignore" });
+  execSync('git config user.name "Test User"', { cwd: repoDir, stdio: "ignore" });
+  fs.writeFileSync(path.join(repoDir, "file.txt"), "hello world\n");
+  execSync("git add file.txt && git commit -m 'initial'", { cwd: repoDir, stdio: "ignore" });
+
+  const dataDir = path.join(tmpBase, "data");
+  const adapter = new AgyAdapter(
+    {
+      enabled: true,
+      executable: "agy",
+      sandbox: true,
+      default_timeout_seconds: 1800,
+    },
+    dataDir
+  );
+
+  const prevHome = process.env.HOME;
+  process.env.HOME = mockHome;
+  try {
+    const spawnInfo = await adapter.prepareStart({
+      taskId: "task-auth-iso",
+      repositoryRoot: repoDir,
+      workspaceRoot: repoDir,
+      instruction: "implement feature",
+      mode: "implement",
+      timeoutMs: 60000,
+      environment: {},
+    });
+
+    // 1. HOME is outside workspace and located under dataDir
+    assert.ok(spawnInfo.env.HOME?.startsWith(dataDir), "AGY HOME must be under dataDir");
+    assert.ok(!spawnInfo.env.HOME?.startsWith(repoDir), "AGY HOME must be outside workspaceRoot");
+
+    // 2. Token was copied to isolated HOME with mode 0600
+    const copiedTokenPath = path.join(spawnInfo.env.HOME!, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+    assert.ok(fs.existsSync(copiedTokenPath), "Token must exist in isolated HOME");
+    assert.equal(fs.readFileSync(copiedTokenPath, "utf-8"), sentinelToken);
+    assert.equal(fs.statSync(copiedTokenPath).mode & 0o777, 0o600);
+
+    // 3. Workspace is completely clean (no untracked files, no .gemini-config)
+    const statusOutput = execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" });
+    assert.equal(statusOutput.trim(), "", "Workspace git status must be completely clean");
+    assert.equal(fs.existsSync(path.join(repoDir, ".gemini-config")), false);
+    assert.equal(fs.existsSync(path.join(repoDir, ".gemini")), false);
+
+    // 4. Git diff contains no token sentinel or .gemini-config
+    const gitService = new GitService();
+    const diffResult = await gitService.getDiff(repoDir, { workspaceRoot: repoDir });
+    assert.ok(!diffResult.diff.includes(sentinelToken), "Diff must NOT leak token");
+    assert.ok(!diffResult.diff.includes(".gemini-config"), "Diff must NOT include .gemini-config");
+  } finally {
+    process.env.HOME = prevHome;
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("AgyAdapter setupAgySettings fails closed when configuration directory cannot be created", async () => {
+  const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-failclose-ws-"));
+  // Create an unwritable file where dataDir would be, so mkdirSync fails
+  const invalidDataDir = path.join(tmpWorkspace, "blocked-file");
+  fs.writeFileSync(invalidDataDir, "not a directory");
+
+  const adapter = new AgyAdapter(
+    {
+      enabled: true,
+      executable: "agy",
+      sandbox: true,
+      default_timeout_seconds: 1800,
+    },
+    invalidDataDir
+  );
+
+  const prevHome = process.env.HOME;
+  try {
+    await assert.rejects(
+      () =>
+        adapter.prepareStart({
+          taskId: "task-fail-closed",
+          repositoryRoot: tmpWorkspace,
+          workspaceRoot: tmpWorkspace,
+          instruction: "try run",
+          mode: "implement",
+          timeoutMs: 60000,
+          environment: { HOME: "/custom/host/home" },
+        }),
+      (err: any) => {
+        assert.equal(err.code, "POLICY_DENIED");
+        assert.ok(err.message.includes("Failed to initialize secure isolated AGY configuration"));
+        return true;
+      }
+    );
+  } finally {
+    process.env.HOME = prevHome;
+    fs.rmSync(tmpWorkspace, { recursive: true, force: true });
+  }
+});
+

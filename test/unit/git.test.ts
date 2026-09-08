@@ -326,6 +326,8 @@ test("GitService reports truncated: true with buffered output on buffer overflow
   assert.equal(diffResult.truncated, true, "Buffer overflow must mark diff as truncated");
   assert.ok(diffResult.diff.length > 0, "Buffered output must NOT be swallowed or empty");
   assert.ok(diffResult.diff.includes("file1.txt") || diffResult.diff.includes("diff --git"));
+  assert.ok(diffResult.files_changed.includes("file1.txt"), "Summary metadata files_changed must be preserved on overflow");
+  assert.ok(diffResult.insertions > 0, "Summary metadata insertions must be preserved on overflow");
 
   fs.rmSync(repoDir, { recursive: true, force: true });
 });

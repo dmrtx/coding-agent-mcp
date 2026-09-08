@@ -21,7 +21,7 @@ All operations are constrained through semantic tools:
 
 Worker agents must never run with unconstrained system access.
 - **Muse**: Executed with `--trust-workspace --disable-approval --approval-mode never` for non-interactive execution, but **without** `--yolo`, keeping Meta's shell/filesystem sandboxing active.
-- **AGY**: Executed with `--sandbox` and an isolated task configuration directory without `--dangerously-skip-permissions`. The isolated configuration sets `enableTerminalSandbox: true`, `toolPermission: "proceed-in-sandbox"`, `allowNonWorkspaceAccess: false`, and granular tool allowlists, ensuring worker actions cannot escape outside the assigned workspace.
+- **AGY**: Executed with `--sandbox` and an isolated task configuration directory without `--dangerously-skip-permissions`. The isolated configuration is placed at `<server.data_dir>/agent-homes/agy/<task-id>` (strictly outside the task repository and workspace) with `0700` directory permissions and `0600` for credentials and `settings.json`. The configuration sets `enableTerminalSandbox: true`, `toolPermission: "proceed-in-sandbox"`, `allowNonWorkspaceAccess: false`, and granular tool allowlists, ensuring worker actions cannot escape outside the assigned workspace. Configuration creation is strictly fail-closed (`POLICY_DENIED` on error, never falling back to host credentials).
 - **Review/Investigate Modes**: Enforce read-only semantics (`--disable-write` and `--disable-shell` on Muse, `--mode plan` on AGY).
 
 ---
@@ -51,15 +51,16 @@ Child agent and verification processes do not inherit the entire host environmen
 
 ---
 
-## 6. Process Lifecycle & Crash Orphan Prevention
+## 6. Process Lifecycle & Crash Orphan Prevention (Defense-in-Depth)
 
 - **Detached Process Groups**: Subprocesses run in detached process groups so signals propagate cleanly to all children (compilers, shell tools, scripts).
-- **Inline Guardian Watchdog**: Each worker process has an attached guardian watchdog connected via an OS pipe. If the MCP server dies abruptly (via `SIGKILL`, kernel crash, or power failure), the OS kernel closes the pipe descriptor and the watchdog terminates the child process group within milliseconds, guaranteeing workers are not left orphaned. Watchdog cleanup is strictly idempotent.
-- **Verifiable Process Identity Recovery**: Active worker metadata (PID, exact command line, canonical working directory, and OS start timestamp from `ps -p <pid> -o lstart=`) is recorded on disk. On server startup, `recoverOrphanedWorkers()` verifies exact OS start time and working directory before signaling, ensuring recycled PIDs running the same binary are never killed.
+- **Multi-Layered Orphan Prevention (Defense-in-Depth)**:
+  - **Inline Guardian Watchdog**: Each worker process has an attached inline watchdog connected via an OS pipe. If the parent MCP server abruptly terminates (e.g., via `SIGKILL`, crash, or unexpected termination), the closed pipe signals the watchdog to terminate the child process group promptly as an immediate defense layer. Watchdog cleanup is strictly idempotent.
+  - **Verifiable Process Identity Recovery on Startup**: Active worker metadata (PID, exact command line, canonical working directory, and OS start timestamp from `ps -p <pid> -o lstart=`) is atomically maintained in `active-workers.json`. On server startup, `recoverOrphanedWorkers()` operates strictly fail-closed: it requires matching OS start times, canonical working directories, and inspectable command lines before signaling. Recycled PIDs belonging to unrelated processes are never killed, and unverified records are preserved in `active-workers.json` rather than dropped.
 - **Immediate Spawn Error Handling**: `spawnProcess` asynchronously awaits initial process spawn and error events, capturing `ENOENT` / missing binary errors cleanly without unhandled exceptions.
 - **Graceful Shutdown**: Server termination (`SIGINT`, `SIGTERM`) triggers `ProcessManager.shutdown()` terminating all active child process groups.
 - **Atomic Concurrency Reservations**: `max_concurrent_tasks` slots are reserved synchronously before any asynchronous operations, preventing concurrency races.
-- **Cumulative Output Cap & Git Buffer Overflow**: Output limits are enforced cumulatively across all continuation turns of a task, strictly capping the single task log size. Git diff operations catch buffer overflow, preserving buffered diff output with `truncated: true`.
+- **Cumulative Output Cap & Git Buffer Overflow**: Output limits are enforced cumulatively across all continuation turns of a task, strictly capping the single task log size. Git diff operations run `--numstat` first so summary statistics (`files_changed`, `insertions`, `deletions`) are preserved even when the patch diff overflows the buffer limit and is truncated (`truncated: true`).
 
 ---
 

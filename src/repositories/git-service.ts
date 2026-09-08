@@ -145,15 +145,8 @@ export class GitService {
       args.push("--staged");
     }
 
-    let bufferOverflow = false;
-
+    // 1. Always run git diff --numstat first to capture metadata (files_changed, insertions, deletions)
     try {
-      const { stdout: diffOutput } = await execFilePromise("git", args, {
-        cwd,
-        maxBuffer: options.maxBuffer,
-      });
-      combinedDiff += diffOutput;
-
       const statArgs = [...args, "--numstat"];
       const { stdout: statOutput } = await execFilePromise("git", statArgs, { cwd });
       const statLines = statOutput.split("\n").filter((l) => l.trim().length > 0);
@@ -168,6 +161,19 @@ export class GitService {
           filesChangedSet.add(parts[2]);
         }
       }
+    } catch {
+      // Fallback if baseSha or HEAD is empty
+    }
+
+    // 2. Run full patch diff in independent try/catch (may overflow maxBuffer and truncate)
+    let bufferOverflow = false;
+
+    try {
+      const { stdout: diffOutput } = await execFilePromise("git", args, {
+        cwd,
+        maxBuffer: options.maxBuffer,
+      });
+      combinedDiff += diffOutput;
     } catch (err: any) {
       if (err?.isMaxBuffer || err?.details?.isMaxBuffer) {
         bufferOverflow = true;

@@ -44,7 +44,7 @@ export interface WorkerIdentity {
   osStartTime?: string;
 }
 
-function getProcessStartTime(pid: number): string | null {
+export function getProcessStartTime(pid: number): string | null {
   try {
     const output = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf-8",
@@ -56,7 +56,7 @@ function getProcessStartTime(pid: number): string | null {
   }
 }
 
-function getProcessCwd(pid: number): string | null {
+export function getProcessCwd(pid: number): string | null {
   try {
     if (process.platform === "linux") {
       return fs.readlinkSync(`/proc/${pid}/cwd`);
@@ -419,56 +419,89 @@ export class ProcessManager {
     if (workers.length === 0) return 0;
 
     let recovered = 0;
+    const remainingWorkers: WorkerIdentity[] = [];
+
     for (const worker of workers) {
+      // 1. Check if PID is alive
       try {
-        // 1. Check if PID is alive
         process.kill(worker.pid, 0);
       } catch {
         // Process is already dead
         continue;
       }
 
-      // 2. Strict identity verification against recycled PIDs
-      if (worker.osStartTime) {
-        const currentStartTime = getProcessStartTime(worker.pid);
-        if (!currentStartTime || currentStartTime !== worker.osStartTime) {
-          console.error(
-            `[coding-agent-mcp] Stale PID ${worker.pid} has recycled start time (expected '${worker.osStartTime}', got '${currentStartTime}'). Skipping.`
-          );
-          continue;
-        }
+      // 2. Strict identity verification against recycled PIDs (Fail-Closed)
+      if (!worker.osStartTime) {
+        console.error(`[coding-agent-mcp] Missing osStartTime for worker PID ${worker.pid}. Skipping.`);
+        remainingWorkers.push(worker);
+        continue;
       }
 
-      if (worker.cwd) {
-        const currentCwd = getProcessCwd(worker.pid);
-        if (currentCwd && canonicalizeDir(currentCwd) !== canonicalizeDir(worker.cwd)) {
-          console.error(
-            `[coding-agent-mcp] Stale PID ${worker.pid} has recycled working directory (expected '${worker.cwd}', got '${currentCwd}'). Skipping.`
-          );
-          continue;
-        }
+      const currentStartTime = getProcessStartTime(worker.pid);
+      if (!currentStartTime) {
+        console.error(`[coding-agent-mcp] Could not inspect start time for worker PID ${worker.pid}. Skipping.`);
+        remainingWorkers.push(worker);
+        continue;
+      }
+
+      if (currentStartTime !== worker.osStartTime) {
+        console.error(
+          `[coding-agent-mcp] Stale PID ${worker.pid} has recycled start time (expected '${worker.osStartTime}', got '${currentStartTime}'). Skipping.`
+        );
+        continue;
+      }
+
+      if (!worker.cwd) {
+        console.error(`[coding-agent-mcp] Missing cwd for worker PID ${worker.pid}. Skipping.`);
+        remainingWorkers.push(worker);
+        continue;
+      }
+
+      const currentCwd = getProcessCwd(worker.pid);
+      if (!currentCwd) {
+        console.error(`[coding-agent-mcp] Could not inspect working directory for worker PID ${worker.pid}. Skipping.`);
+        remainingWorkers.push(worker);
+        continue;
+      }
+
+      if (canonicalizeDir(currentCwd) !== canonicalizeDir(worker.cwd)) {
+        console.error(
+          `[coding-agent-mcp] Stale PID ${worker.pid} has recycled working directory (expected '${worker.cwd}', got '${currentCwd}'). Skipping.`
+        );
+        continue;
       }
 
       // 3. Verify verifiable identity: does the PID's actual command match worker?
+      let cmdOutput: string | null = null;
       try {
-        const cmdOutput = execFileSync("ps", ["-p", String(worker.pid), "-o", "command="], {
+        cmdOutput = execFileSync("ps", ["-p", String(worker.pid), "-o", "command="], {
           encoding: "utf-8",
           stdio: ["ignore", "pipe", "ignore"],
         }).trim();
+      } catch {
+        cmdOutput = null;
+      }
 
-        const matchesCommand =
-          cmdOutput.includes(worker.command) ||
-          cmdOutput.includes(worker.taskId) ||
-          (worker.args && worker.args.some((arg) => arg.length > 3 && cmdOutput.includes(arg)));
+      if (!cmdOutput) {
+        console.error(`[coding-agent-mcp] Could not inspect command line for worker PID ${worker.pid}. Skipping.`);
+        remainingWorkers.push(worker);
+        continue;
+      }
 
-        if (!matchesCommand) {
-          console.error(
-            `[coding-agent-mcp] Stale PID ${worker.pid} has been recycled by another process (${cmdOutput}). Skipping.`
-          );
-          continue;
-        }
+      const matchesCommand =
+        cmdOutput.includes(worker.command) ||
+        cmdOutput.includes(worker.taskId) ||
+        (worker.args && worker.args.some((arg) => arg.length > 3 && cmdOutput.includes(arg)));
 
-        // Identity confirmed: safely terminate orphaned process group
+      if (!matchesCommand) {
+        console.error(
+          `[coding-agent-mcp] Stale PID ${worker.pid} has been recycled by another process (${cmdOutput}). Skipping.`
+        );
+        continue;
+      }
+
+      // Identity confirmed: safely terminate orphaned process group
+      try {
         console.error(
           `[coding-agent-mcp] Terminating orphaned worker PID ${worker.pid} for task ${worker.taskId}...`
         );
@@ -482,13 +515,15 @@ export class ProcessManager {
         }
         recovered++;
       } catch {
-        // Process could not be inspected or killed
+        remainingWorkers.push(worker);
       }
     }
 
     try {
       const file = path.join(this.dataDir, "active-workers.json");
-      if (fs.existsSync(file)) {
+      if (remainingWorkers.length > 0) {
+        fs.writeFileSync(file, JSON.stringify(remainingWorkers, null, 2), "utf-8");
+      } else if (fs.existsSync(file)) {
         fs.unlinkSync(file);
       }
     } catch {
