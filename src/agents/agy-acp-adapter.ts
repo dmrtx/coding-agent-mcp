@@ -12,6 +12,8 @@ import {
   type ManagedStartResult,
   type ManagedContinueInput,
   type ManagedContinueResult,
+  type ManagedCancelInput,
+  type ManagedCancelResult,
 } from "../domain/agent.js";
 import type { AgyAcpConfig } from "../config/schema.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
@@ -107,6 +109,38 @@ export interface AcpPermissionContext {
 export interface AcpPermissionAnswer {
   decision: "allow" | "deny";
   reason: string;
+}
+
+/**
+ * Live-turn context owned by `runAcpTurn` for managed cancellation. Only
+ * carries what `cancelManagedTask` needs: the kernel child, the protocol
+ * client once constructed, the current session id once established, and a
+ * turn-settled signal resolved exactly once at settle time.
+ */
+interface ActiveAcpTurn {
+  child: ChildProcess;
+  client?: AcpClient;
+  sessionId?: string;
+  settled: Promise<void>;
+  markSettled: () => void;
+  /** True once a `session/cancel` RPC has been attempted (no duplicate RPCs). */
+  cancelRpcSent: boolean;
+  /** Kernel acknowledgement of the cancel RPC, when one was attempted. */
+  cancelAcknowledged?: boolean;
+  /** The single per-turn SIGKILL escalation timer, when armed. */
+  killEscalation?: ReturnType<typeof setTimeout>;
+}
+
+/** Resolve true when `settled` resolves first, false on timeout. Never hangs. */
+function waitForTurnSettled(settled: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  return Promise.race([settled.then(() => true), timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
 
 function expandHomeDir(filePath: string): string {
@@ -208,6 +242,7 @@ export class AgyAcpAdapter implements CodingAgent {
   public readonly id = "agy-acp";
   public readonly displayName = "Antigravity ACP";
   private readonly config: AgyAcpConfig;
+  private readonly activeTurns = new Map<string, ActiveAcpTurn>();
 
   constructor(config: AgyAcpConfig) {
     this.config = config;
@@ -425,6 +460,18 @@ export class AgyAcpAdapter implements CodingAgent {
     }
     if (!spawnEnv.PATH && process.env.PATH) spawnEnv.PATH = process.env.PATH;
 
+    const turnKey =
+      typeof options.taskId === "string" && options.taskId.length > 0
+        ? options.taskId
+        : undefined;
+    if (turnKey !== undefined && this.activeTurns.has(turnKey)) {
+      throw new CodingAgentError(
+        ErrorCodes.INTERNAL_ERROR,
+        `AgyAcpAdapter already has an active turn for task '${turnKey}'`,
+        { agent: this.id, taskId: turnKey }
+      );
+    }
+
     let child: ChildProcess;
     try {
       child = spawn(executable, args, {
@@ -438,6 +485,43 @@ export class AgyAcpAdapter implements CodingAgent {
         `Failed to spawn ACP executable '${executable}': ${err?.message ?? String(err)}`,
         { agent: this.id, executable, cwd }
       );
+    }
+
+    // Install the cancel context immediately after spawning. The
+    // check-and-set is synchronous (no await in between), so a concurrent
+    // turn for the same task id cannot slip past the pre-spawn guard.
+    let activeTurn: ActiveAcpTurn | undefined;
+    if (turnKey !== undefined) {
+      if (this.activeTurns.has(turnKey)) {
+        try {
+          child.stdin?.destroy();
+        } catch {
+          // ignore
+        }
+        try {
+          child.kill();
+        } catch {
+          // ignore
+        }
+        throw new CodingAgentError(
+          ErrorCodes.INTERNAL_ERROR,
+          `AgyAcpAdapter already has an active turn for task '${turnKey}'`,
+          { agent: this.id, taskId: turnKey }
+        );
+      }
+      let markSettled!: () => void;
+      const settledPromise = new Promise<void>((resolveSettled) => {
+        markSettled = resolveSettled;
+      });
+      activeTurn = {
+        child,
+        client: undefined,
+        sessionId: undefined,
+        settled: settledPromise,
+        markSettled,
+        cancelRpcSent: false,
+      };
+      this.activeTurns.set(turnKey, activeTurn);
     }
 
     return await new Promise<AcpTurnResult>((resolve, reject) => {
@@ -461,6 +545,7 @@ export class AgyAcpAdapter implements CodingAgent {
           return this.decidePermissionRequest(params, permissionContext);
         },
       });
+      if (activeTurn) activeTurn.client = client;
 
       const overallTimer = setTimeout(() => {
         settleReject(
@@ -493,30 +578,49 @@ export class AgyAcpAdapter implements CodingAgent {
           // ignore
         }
         // A kernel that ignores SIGTERM must not linger: escalate once.
-        try {
-          clearTimeout(killEscalation);
-          killEscalation = setTimeout(() => {
-            try {
-              if (child.exitCode === null) child.kill("SIGKILL");
-            } catch {
-              // ignore
-            }
-          }, 3000);
-          (killEscalation as unknown as { unref?: () => void }).unref?.();
-        } catch {
-          // ignore
+        // A cancel-owned fallback arms the same per-turn timer, so a
+        // managed cancel racing this cleanup can never double-arm SIGKILL.
+        if (activeTurn) {
+          this.scheduleKillEscalation(activeTurn);
+        } else {
+          try {
+            clearTimeout(killEscalation);
+            killEscalation = setTimeout(() => {
+              try {
+                if (child.exitCode === null) child.kill("SIGKILL");
+              } catch {
+                // ignore
+              }
+            }, 3000);
+            (killEscalation as unknown as { unref?: () => void }).unref?.();
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      // Mark the turn settled and drop the cancel-registry entry BEFORE
+      // transport teardown: a concurrent cancel waiter must observe
+      // settlement and can never hang on a removed-but-unmarked turn.
+      const settleTurnContext = (): void => {
+        if (turnKey === undefined || !activeTurn) return;
+        if (this.activeTurns.get(turnKey) === activeTurn) {
+          activeTurn.markSettled();
+          this.activeTurns.delete(turnKey);
         }
       };
 
       const settleResolve = (value: AcpTurnResult): void => {
         if (settled) return;
         settled = true;
+        settleTurnContext();
         cleanup();
         resolve(value);
       };
       const settleReject = (err: unknown): void => {
         if (settled) return;
         settled = true;
+        settleTurnContext();
         cleanup();
         reject(err);
       };
@@ -609,6 +713,7 @@ export class AgyAcpAdapter implements CodingAgent {
             }
             sessionId = rawSessionId.trim();
           }
+          if (activeTurn) activeTurn.sessionId = sessionId;
           const answer = (await client.sessionPrompt({
             sessionId,
             prompt,
@@ -1046,6 +1151,130 @@ export class AgyAcpAdapter implements CodingAgent {
           .decidePermissionRequest;
       }
     }
+  }
+
+  /**
+   * Arm the single per-turn SIGKILL escalation timer. Shared by the turn
+   * `cleanup()` and the cancel fallback so a cancel racing settle can never
+   * double-arm it. The kernel runs attached (no detached process group),
+   * so a group kill is never used: it would endanger the server itself.
+   */
+  private scheduleKillEscalation(turn: ActiveAcpTurn): void {
+    try {
+      if (turn.killEscalation) return;
+      turn.killEscalation = setTimeout(() => {
+        try {
+          if (turn.child.exitCode === null) turn.child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      }, 3000);
+      (turn.killEscalation as unknown as { unref?: () => void }).unref?.();
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Adapter-owned process fallback: the established teardown sequence
+   * (close client so the pending prompt settles, destroy stdin, SIGTERM).
+   * Returns true when termination was initiated (or the child already
+   * exited, in which case the exit handler settles the turn).
+   */
+  private terminateTurnChild(turn: ActiveAcpTurn): boolean {
+    try {
+      turn.client?.close("agy-acp managed cancel fallback");
+    } catch {
+      // ignore: close is idempotent; transport teardown continues below.
+    }
+    try {
+      turn.child.stdin?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      turn.child.kill();
+      return true;
+    } catch {
+      try {
+        return turn.child.exitCode !== null || turn.child.signalCode !== null;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Managed-cancel hook.
+   *
+   * Cooperative cancel first: when the active turn for `taskId` has a known
+   * session id and an open client, `session/cancel` is sent BEFORE any
+   * process signal is touched, bounded by `graceTimeoutMs` (floored to a
+   * small positive so a degenerate grace cannot long-block). The turn is
+   * then awaited up to `graceTimeoutMs`; a settled turn reports
+   * `acknowledged`. Otherwise the adapter falls back to its own process
+   * teardown (SIGTERM plus the single per-turn SIGKILL escalation) and
+   * still reports `acknowledged`, because the adapter itself owns
+   * termination. Unknown task ids report `fallback` so TaskManager can use
+   * its legacy path. Structured `failed` is reserved for a fallback that
+   * cannot even be initiated.
+   */
+  public async cancelManagedTask(input: ManagedCancelInput): Promise<ManagedCancelResult> {
+    const taskId = input.taskId;
+    const turn = typeof taskId === "string" ? this.activeTurns.get(taskId) : undefined;
+    if (!turn) {
+      return { status: "fallback" };
+    }
+
+    const MIN_CANCEL_GRACE_MS = 100;
+    const rawGrace = input.graceTimeoutMs;
+    const graceMs =
+      typeof rawGrace === "number" && Number.isFinite(rawGrace)
+        ? Math.max(MIN_CANCEL_GRACE_MS, Math.floor(rawGrace))
+        : MIN_CANCEL_GRACE_MS;
+
+    // Cooperative path first: no process signal may precede this attempt
+    // whenever a session id and an open client are available. A duplicate
+    // concurrent cancel skips the RPC (already attempted) but still shares
+    // the settle wait and fallback below.
+    const sessionId = typeof turn.sessionId === "string" ? turn.sessionId.trim() : "";
+    const client = turn.client;
+    if (!turn.cancelRpcSent && sessionId.length > 0 && client && !client.isClosed) {
+      turn.cancelRpcSent = true;
+      try {
+        const result = await client.sessionCancel({ sessionId }, { timeoutMs: graceMs });
+        turn.cancelAcknowledged =
+          result === null || typeof result !== "object"
+            ? true
+            : (result as { cancelled?: unknown }).cancelled !== false;
+      } catch {
+        turn.cancelAcknowledged = false;
+      }
+    }
+
+    if (await waitForTurnSettled(turn.settled, graceMs)) {
+      return { status: "acknowledged" };
+    }
+
+    if (this.activeTurns.get(taskId) !== turn) {
+      // Settled concurrently with the grace expiry (cleanup already ran):
+      // nothing left to terminate.
+      return { status: "acknowledged" };
+    }
+
+    const terminated = this.terminateTurnChild(turn);
+    this.scheduleKillEscalation(turn);
+    if (!terminated) {
+      return {
+        status: "failed",
+        failure: {
+          code: ErrorCodes.INTERNAL_ERROR,
+          message: `Failed to terminate ACP kernel for task '${taskId}'`,
+          details: { taskId },
+        },
+      };
+    }
+    return { status: "acknowledged" };
   }
 
   // CodingAgent conformance: TaskManager wiring lands in slice 2, so direct
