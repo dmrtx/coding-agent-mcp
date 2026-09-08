@@ -4,7 +4,10 @@ import path from "node:path";
 import yaml from "yaml";
 import { AppConfig, AppConfigSchema } from "./schema.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
-import { assertDataDirDisjointFromRepositories } from "../security/path-policy.js";
+import {
+  assertAgyAcpStateDirDisjointFromRepositories,
+  assertDataDirDisjointFromRepositories,
+} from "../security/path-policy.js";
 
 export function expandHome(filePath: string): string {
   if (filePath.startsWith("~/") || filePath === "~") {
@@ -87,12 +90,27 @@ export function loadConfig(customPath?: string, rawOverrides?: Partial<AppConfig
   // Normalize server data_dir
   config.server.data_dir = path.resolve(expandHome(config.server.data_dir));
 
+  // Normalize experimental agy-acp state_dir (phase 1 foundation only; the
+  // adapter that would consume it does not exist yet). May be absent when
+  // the operator lists an explicit `agents` subset without `agy-acp`.
+  const agyAcp = (config.agents as Record<string, { state_dir?: string }>)["agy-acp"];
+  if (agyAcp?.state_dir) {
+    agyAcp.state_dir = path.resolve(expandHome(agyAcp.state_dir));
+  }
+
   // Normalize repositories roots
   for (const [alias, repo] of Object.entries(config.repositories)) {
     repo.root = path.resolve(expandHome(repo.root));
   }
 
   assertDataDirDisjointFromRepositories(config.server.data_dir, config.repositories);
+
+  // Runtime ACP state must never live inside a repository worktree (it
+  // would pollute status/diff and risk credential leaks into commits).
+  // Living under server.data_dir (the default) stays allowed.
+  if (agyAcp?.state_dir) {
+    assertAgyAcpStateDirDisjointFromRepositories(agyAcp.state_dir, config.repositories);
+  }
 
   return config;
 }

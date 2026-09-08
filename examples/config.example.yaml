@@ -43,6 +43,30 @@ agents:
       - LC_ALL
       - TERM
 
+  # Experimental additive Antigravity ACP foundation (phase 1: config only).
+  # Disabled by default. Requires the operator to install/provide the official
+  # `agy_acp_server` binary; there is no downloader. Legacy `agy` above
+  # remains the default and ACP execution is NOT wired into start_task yet.
+  # See docs/agy-acp.md.
+  agy-acp:
+    enabled: false
+    acp_executable: agy_acp_server
+    auth_method: oauth-personal # oauth-personal|oauth-business|gemini-api-key|agent-platform
+    # model: <model-id-from-session-config-options> # optional model override (illustrative placeholder)
+    mode: default # default|auto_edit|yolo (yolo requires allow_write_worktree: true)
+    allow_write_worktree: false
+    state_dir: ~/.coding-agent-mcp/agy-acp
+    default_timeout_seconds: 1800
+    env_allowlist:
+      - HOME
+      - PATH
+      - TMPDIR
+      - USER
+      - SHELL
+      - LANG
+      - LC_ALL
+      - TERM
+
 repositories:
   my-project:
     root: /path/to/my-project
