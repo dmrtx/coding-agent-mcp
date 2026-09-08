@@ -158,8 +158,16 @@ function handleRequest(msg) {
         errorTo(id, -32002, `Unknown session: ${String(sessionId)}`);
         return;
       }
-      const promptText = typeof p.prompt === "string" ? p.prompt : "";
-      sessions.get(sessionId).lastPrompt = typeof p.prompt === "string" ? p.prompt : null;
+      const rawPrompt = p.prompt;
+      const promptText =
+        typeof rawPrompt === "string"
+          ? rawPrompt
+          : Array.isArray(rawPrompt)
+            ? rawPrompt
+                .map((block) => (isRecord(block) && typeof block.text === "string" ? block.text : ""))
+                .join("\n")
+            : "";
+      sessions.get(sessionId).lastPrompt = promptText.length > 0 ? promptText : null;
       // Marker for cooperative cancel: hold the prompt open until the
       // client sends session/cancel for this session (handled below).
       if (promptText.includes("[[BLOCK_UNTIL_CANCEL]]")) {

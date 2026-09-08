@@ -393,3 +393,40 @@ test("session/new carries empty mcpServers for official-kernel compat", async ()
   assert.ok(captured !== null && typeof captured === "object", "session/new params must be captured");
   assert.deepEqual((captured as Record<string, unknown>).mcpServers, []);
 });
+
+test("session/prompt sends one text content block carrying the instruction", async () => {
+  assert.ok(fs.existsSync(FIXTURE), `fake kernel fixture must exist at ${FIXTURE}`);
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-prompt-ws-"));
+  fs.writeFileSync(path.join(workspace, "README.md"), "# test\n");
+  const adapter = new AgyAcpAdapter(makeConfig({ acp_executable: process.execPath }));
+  const orig = AcpClient.prototype.sessionPrompt;
+  let captured: unknown;
+  (AcpClient.prototype as unknown as Record<string, unknown>).sessionPrompt = function (
+    this: AcpClient,
+    params: Record<string, unknown>,
+    options?: unknown
+  ) {
+    captured = params;
+    return orig.call(this, params, options as never);
+  };
+  try {
+    const result = await adapter.runAcpTurn({
+      executable: process.execPath,
+      args: [FIXTURE],
+      prompt: "read the readme",
+      timeoutMs: 15_000,
+      workspaceRoot: workspace,
+      mode: "implement",
+    });
+    assert.ok(result.sessionId.startsWith("sess-"));
+  } finally {
+    (AcpClient.prototype as unknown as Record<string, unknown>).sessionPrompt = orig;
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+  assert.ok(captured !== null && typeof captured === "object", "session/prompt params must be captured");
+  const params = captured as Record<string, unknown>;
+  assert.ok(typeof params.sessionId === "string" && params.sessionId.startsWith("sess-"));
+  assert.ok(Array.isArray(params.prompt), "session/prompt prompt must be an array of content blocks");
+  assert.equal((params.prompt as unknown[]).length, 1, "prompt must carry exactly one content block");
+  assert.deepEqual(params.prompt, [{ type: "text", text: "read the readme" }]);
+});
