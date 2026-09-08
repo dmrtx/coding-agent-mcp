@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import { AppConfig, RepositoryConfig } from "../config/schema.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
+import { canonicalizePath } from "../security/path-policy.js";
 
 export interface RepositorySummary {
   id: string;
   writable: boolean;
+  allow_in_place: boolean;
   default_workspace_strategy: string;
   verification_profiles: string[];
 }
@@ -19,10 +21,11 @@ export class RepositoryRegistry {
   }
 
   public registerRepository(alias: string, repoConfig: RepositoryConfig): void {
-    if (!fs.existsSync(repoConfig.root)) {
-      // We allow warning or registering, but let's ensure it's recorded
-    }
-    this.repositories.set(alias, repoConfig);
+    const canonicalRoot = canonicalizePath(repoConfig.root);
+    this.repositories.set(alias, {
+      ...repoConfig,
+      root: canonicalRoot,
+    });
   }
 
   public getRepository(alias: string): RepositoryConfig {
@@ -50,6 +53,7 @@ export class RepositoryRegistry {
       list.push({
         id,
         writable: repo.writable,
+        allow_in_place: repo.allow_in_place,
         default_workspace_strategy: repo.default_workspace_strategy,
         verification_profiles: Object.keys(repo.verification_profiles),
       });

@@ -17,7 +17,16 @@ All operations are constrained through semantic tools:
 
 ---
 
-## 2. Repository Allowlist & Path Containment
+## 2. Worker Agent Sandboxing
+
+Worker agents must never run with unconstrained system access.
+- **Muse**: Executed with `--disable-approval --approval-mode never` for non-interactive execution, but **without** `--yolo`, keeping OS/filesystem/network sandboxing active.
+- **AGY**: Executed with `--sandbox --dangerously-skip-permissions`, ensuring terminal and filesystem sandboxing restrictions remain enforced.
+- **Review/Investigate Modes**: Enforce read-only semantics (`--disable-write` on Muse, `--mode plan` on AGY).
+
+---
+
+## 3. Repository Allowlist & Path Containment
 
 - Only repository aliases configured in the configuration file can be accessed.
 - Dynamic filesystem paths from callers are rejected.
@@ -25,7 +34,7 @@ All operations are constrained through semantic tools:
 
 ---
 
-## 3. Environment Variable Sanitization
+## 4. Environment Variable Sanitization
 
 Child agent and verification processes do not inherit the entire host environment.
 - Environment variables are filtered against a strict allowlist (e.g. `HOME`, `PATH`, `TMPDIR`, `USER`, `SHELL`, `LANG`, `LC_ALL`, `TERM`).
@@ -33,16 +42,23 @@ Child agent and verification processes do not inherit the entire host environmen
 
 ---
 
-## 4. Worktree Isolation
+## 5. Worktree Isolation & in_place Safety
 
-- Tasks default to Git worktrees under `~/.coding-agent-mcp/workspaces/<task-id>`.
-- Parallel tasks operate in separate worktrees with distinct branches (`agent/<task-id>`).
-- Direct changes to developer active work are avoided.
-- For `in_place` tasks, mutual exclusion is enforced per repository to prevent concurrent conflicting writes.
+- **Worktree Isolation**: Tasks default to Git worktrees under `~/.coding-agent-mcp/workspaces/<task-id>` on dedicated `agent/<task-id>` branches.
+- **in_place Restrictions**: `in_place` workspace strategy is disabled by default (`allow_in_place: false`). If explicitly enabled, `in_place` tasks are rejected if the working tree has uncommitted or untracked changes (`WORKSPACE_CONFLICT`), and only one writer task is permitted at a time.
 
 ---
 
-## 5. Verification Profile Restrictions
+## 6. Process Lifecycle & Shutdown Safety
+
+- Subprocesses are spawned in detached process groups.
+- Timeouts and cancellations terminate the entire process group gracefully (SIGTERM followed by SIGKILL after a grace period).
+- Server termination (`SIGINT`, `SIGTERM`) triggers an active shutdown routine that terminates all running worker process trees before exiting, preventing orphan workers from modifying files after shutdown.
+- Stale process IDs are tracked on disk to clean up any orphaned processes across server crashes.
+
+---
+
+## 7. Verification Profile Restrictions
 
 - `run_verification` only executes pre-configured profiles (such as `test` or `lint`).
 - Arbitrary command injection or modification of verification commands is rejected.

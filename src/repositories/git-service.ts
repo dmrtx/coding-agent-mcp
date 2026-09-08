@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { execFile } from "node:child_process";
 import { RepoGitStatus, GitFileStatus, GitDiffResult } from "../domain/repository.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
@@ -6,21 +8,27 @@ function execFilePromise(
   file: string,
   args: string[],
   options: { cwd: string }
-): Promise<{ stdout: string; stderr: string }> {
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, options, (error: (Error & { code?: number | string }) | null, stdout: string, stderr: string) => {
-      if (error) {
-        reject(
-          new CodingAgentError(
-            ErrorCodes.INTERNAL_ERROR,
-            `Git command failed: git ${args.join(" ")} in ${options.cwd}. ${stderr || error.message}`,
-            { stdout, stderr, exitCode: error.code }
-          )
-        );
-        return;
+    execFile(
+      file,
+      args,
+      options,
+      (error: (Error & { code?: number | string }) | null, stdout: string, stderr: string) => {
+        const exitCode = typeof error?.code === "number" ? error.code : error ? 1 : 0;
+        if (error && exitCode !== 1) {
+          reject(
+            new CodingAgentError(
+              ErrorCodes.INTERNAL_ERROR,
+              `Git command failed: git ${args.join(" ")} in ${options.cwd}. ${stderr || error.message}`,
+              { stdout, stderr, exitCode }
+            )
+          );
+          return;
+        }
+        resolve({ stdout, stderr, exitCode });
       }
-      resolve({ stdout, stderr });
-    });
+    );
   });
 }
 
@@ -34,7 +42,7 @@ export class GitService {
     }
   }
 
-  public async getStatus(cwd: string): Promise<RepoGitStatus> {
+  public async getStatus(cwd: string, baseSha?: string): Promise<RepoGitStatus> {
     const { stdout } = await execFilePromise("git", ["status", "--porcelain=v1", "-b", "-uall"], {
       cwd,
     });
@@ -76,7 +84,7 @@ export class GitService {
 
     return {
       branch,
-      base_sha: headSha,
+      base_sha: baseSha ?? headSha,
       head_sha: headSha,
       clean: files.length === 0,
       files,
@@ -85,22 +93,26 @@ export class GitService {
 
   public async getDiff(
     cwd: string,
-    options: { staged?: boolean; max_bytes?: number } = {}
+    options: { baseSha?: string; staged?: boolean; max_bytes?: number; includeUntracked?: boolean } = {}
   ): Promise<GitDiffResult> {
     const maxBytes = options.max_bytes ?? 100_000;
+    const filesChangedSet = new Set<string>();
+    let insertions = 0;
+    let deletions = 0;
+    let combinedDiff = "";
+
     const args = ["diff"];
-    if (options.staged) {
+    if (options.baseSha) {
+      // Diffs base commit against current working tree (including committed, staged, and unstaged tracked changes!)
+      args.push(options.baseSha);
+    } else if (options.staged) {
       args.push("--staged");
     }
 
-    const { stdout: diffOutput } = await execFilePromise("git", args, { cwd });
-
-    // Also get stats
-    const filesChanged: string[] = [];
-    let insertions = 0;
-    let deletions = 0;
-
     try {
+      const { stdout: diffOutput } = await execFilePromise("git", args, { cwd });
+      combinedDiff += diffOutput;
+
       const statArgs = [...args, "--numstat"];
       const { stdout: statOutput } = await execFilePromise("git", statArgs, { cwd });
       const statLines = statOutput.split("\n").filter((l) => l.trim().length > 0);
@@ -112,14 +124,64 @@ export class GitService {
           const del = parseInt(parts[1], 10) || 0;
           insertions += ins;
           deletions += del;
-          filesChanged.push(parts[2]);
+          filesChangedSet.add(parts[2]);
         }
       }
     } catch {
-      // Non-critical if numstat fails
+      // Fallback if baseSha or HEAD is empty
     }
 
-    let diffText = diffOutput;
+    // Include untracked files unless explicitly disabled
+    if (options.includeUntracked !== false) {
+      try {
+        const { stdout: statusOut } = await execFilePromise(
+          "git",
+          ["status", "--porcelain=v1", "-uall"],
+          { cwd }
+        );
+        const statusLines = statusOut.split("\n").filter((l) => l.trim().length > 0);
+
+        for (const line of statusLines) {
+          if (line.startsWith("?? ")) {
+            const relPath = line.slice(3).trim();
+            const fullPath = path.join(cwd, relPath);
+            if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
+              filesChangedSet.add(relPath);
+
+              // Generate unified diff for untracked file using git diff --no-index
+              try {
+                const { stdout: untrackedDiff } = await execFilePromise(
+                  "git",
+                  ["diff", "--no-index", "--", "/dev/null", relPath],
+                  { cwd }
+                );
+                if (untrackedDiff) {
+                  if (combinedDiff.length > 0 && !combinedDiff.endsWith("\n")) {
+                    combinedDiff += "\n";
+                  }
+                  combinedDiff += untrackedDiff;
+                }
+              } catch {
+                // Ignore diff generation failures for binary/empty files
+              }
+
+              // Count lines as insertions
+              try {
+                const content = fs.readFileSync(fullPath, "utf-8");
+                const lineCount = content.split("\n").length;
+                insertions += lineCount;
+              } catch {
+                // Ignore binary read error
+              }
+            }
+          }
+        }
+      } catch {
+        // Non-critical if untracked inspection fails
+      }
+    }
+
+    let diffText = combinedDiff;
     let truncated = false;
     const byteLength = Buffer.byteLength(diffText, "utf-8");
 
@@ -132,7 +194,7 @@ export class GitService {
     return {
       diff: diffText,
       truncated,
-      files_changed: filesChanged,
+      files_changed: Array.from(filesChangedSet),
       insertions,
       deletions,
     };

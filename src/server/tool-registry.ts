@@ -7,6 +7,7 @@ import { GitService } from "../repositories/git-service.js";
 import { VerificationService } from "../verification/verification-service.js";
 import { WorkspaceManager } from "../repositories/workspace-manager.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
+import { assertPathContained } from "../security/path-policy.js";
 
 export interface ToolServices {
   agentRegistry: AgentRegistry;
@@ -158,6 +159,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
           finished_at: task.finishedAt,
           exit_code: task.exitCode,
           session_resumable: task.sessionResumable,
+          base_sha: task.baseSha,
           failure: task.failure,
           workspace_strategy: task.workspaceStrategy,
         };
@@ -225,12 +227,17 @@ export function registerTools(server: McpServer, services: ToolServices): void {
     async (args) => {
       try {
         let cwd: string;
+        let baseSha: string | undefined = undefined;
+
         if (args.task_id) {
           const task = services.taskManager.getTask(args.task_id);
           cwd = task.workspaceRoot;
+          baseSha = task.baseSha;
+          assertPathContained(cwd, task.workspaceRoot);
         } else if (args.repository) {
           const repo = services.repoRegistry.getRepository(args.repository);
           cwd = repo.root;
+          assertPathContained(cwd, repo.root);
         } else {
           throw new CodingAgentError(
             ErrorCodes.POLICY_DENIED,
@@ -238,7 +245,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
           );
         }
 
-        const status = await services.gitService.getStatus(cwd);
+        const status = await services.gitService.getStatus(cwd, baseSha);
         return {
           content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
         };
@@ -251,7 +258,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   // 9. get_diff
   server.tool(
     "get_diff",
-    "Returns the Git diff for a task workspace or configured repository",
+    "Returns the Git diff for a task workspace or configured repository (including committed changes since task base SHA and untracked files)",
     {
       task_id: z.string().optional().describe("Task ID (queries task workspace)"),
       repository: z.string().optional().describe("Repository alias (queries repository root)"),
@@ -261,12 +268,17 @@ export function registerTools(server: McpServer, services: ToolServices): void {
     async (args) => {
       try {
         let cwd: string;
+        let baseSha: string | undefined = undefined;
+
         if (args.task_id) {
           const task = services.taskManager.getTask(args.task_id);
           cwd = task.workspaceRoot;
+          baseSha = task.baseSha;
+          assertPathContained(cwd, task.workspaceRoot);
         } else if (args.repository) {
           const repo = services.repoRegistry.getRepository(args.repository);
           cwd = repo.root;
+          assertPathContained(cwd, repo.root);
         } else {
           throw new CodingAgentError(
             ErrorCodes.POLICY_DENIED,
@@ -275,8 +287,10 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         }
 
         const diffResult = await services.gitService.getDiff(cwd, {
+          baseSha,
           staged: args.staged,
           max_bytes: args.max_bytes,
+          includeUntracked: true,
         });
         return {
           content: [{ type: "text", text: JSON.stringify(diffResult, null, 2) }],
@@ -305,10 +319,12 @@ export function registerTools(server: McpServer, services: ToolServices): void {
           const task = services.taskManager.getTask(args.task_id);
           cwd = task.workspaceRoot;
           repoAlias = task.repositoryId;
+          assertPathContained(cwd, task.workspaceRoot);
         } else if (args.repository) {
           const repo = services.repoRegistry.getRepository(args.repository);
           cwd = repo.root;
           repoAlias = args.repository;
+          assertPathContained(cwd, repo.root);
         } else {
           throw new CodingAgentError(
             ErrorCodes.POLICY_DENIED,

@@ -16,6 +16,7 @@ agents:
   muse:
     enabled: true
     executable: muse
+    sandbox: true
     default_timeout_seconds: 1800
     env_allowlist:
       - HOME
@@ -30,6 +31,7 @@ agents:
   agy:
     enabled: true
     executable: agy
+    sandbox: true
     default_timeout_seconds: 1800
     env_allowlist:
       - HOME
@@ -45,6 +47,7 @@ repositories:
   my-project:
     root: /path/to/my-project
     writable: true
+    allow_in_place: false # in_place strategy is disabled by default for safety
     default_workspace_strategy: worktree
     verification_profiles:
       test:

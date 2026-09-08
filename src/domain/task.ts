@@ -33,6 +33,7 @@ export interface CodingTask {
   mode: AgentTaskMode;
   workspaceStrategy: WorkspaceStrategy;
   workspaceRoot: string;
+  baseSha?: string;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

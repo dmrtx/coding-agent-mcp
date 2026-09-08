@@ -5,6 +5,7 @@ import { WorkspaceDescriptor, WorkspaceStrategy } from "../domain/repository.js"
 import { RepositoryConfig } from "../config/schema.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 import { GitService } from "./git-service.js";
+import { assertPathContained, canonicalizePath } from "../security/path-policy.js";
 
 function execFilePromise(
   file: string,
@@ -12,19 +13,24 @@ function execFilePromise(
   options: { cwd: string }
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, options, (error: (Error & { code?: number | string }) | null, stdout: string, stderr: string) => {
-      if (error) {
-        reject(
-          new CodingAgentError(
-            ErrorCodes.INTERNAL_ERROR,
-            `Command failed: ${file} ${args.join(" ")} in ${options.cwd}. ${stderr || error.message}`,
-            { stdout, stderr, exitCode: error.code }
-          )
-        );
-        return;
+    execFile(
+      file,
+      args,
+      options,
+      (error: (Error & { code?: number | string }) | null, stdout: string, stderr: string) => {
+        if (error) {
+          reject(
+            new CodingAgentError(
+              ErrorCodes.INTERNAL_ERROR,
+              `Command failed: ${file} ${args.join(" ")} in ${options.cwd}. ${stderr || error.message}`,
+              { stdout, stderr, exitCode: error.code }
+            )
+          );
+          return;
+        }
+        resolve({ stdout, stderr });
       }
-      resolve({ stdout, stderr });
-    });
+    );
   });
 }
 
@@ -35,7 +41,7 @@ export class WorkspaceManager {
   private readonly activeWorkspaces: Map<string, WorkspaceDescriptor> = new Map();
 
   constructor(dataDir: string, gitService: GitService) {
-    this.dataDir = dataDir;
+    this.dataDir = canonicalizePath(dataDir);
     this.gitService = gitService;
   }
 
@@ -56,6 +62,14 @@ export class WorkspaceManager {
     const chosenStrategy = strategy ?? repoConfig.default_workspace_strategy ?? "worktree";
 
     if (chosenStrategy === "in_place") {
+      if (!repoConfig.allow_in_place) {
+        throw new CodingAgentError(
+          ErrorCodes.POLICY_DENIED,
+          `in_place workspace strategy is not permitted for repository '${repositoryId}'. Configuration specifies allow_in_place: false.`,
+          { repository: repositoryId }
+        );
+      }
+
       if (this.inPlaceLocks.has(repositoryId)) {
         throw new CodingAgentError(
           ErrorCodes.WORKSPACE_CONFLICT,
@@ -63,6 +77,17 @@ export class WorkspaceManager {
           { repository: repositoryId }
         );
       }
+
+      // Check clean working tree before granting in_place access
+      const status = await this.gitService.getStatus(repoConfig.root);
+      if (!status.clean) {
+        throw new CodingAgentError(
+          ErrorCodes.WORKSPACE_CONFLICT,
+          `Repository '${repositoryId}' has uncommitted changes or untracked files. in_place strategy requires a clean working tree.`,
+          { repository: repositoryId, files: status.files }
+        );
+      }
+
       this.inPlaceLocks.add(repositoryId);
 
       const baseSha = await this.gitService.getHeadSha(repoConfig.root);
@@ -74,6 +99,7 @@ export class WorkspaceManager {
         workspaceRoot: repoConfig.root,
         repositoryRoot: repoConfig.root,
         baseSha,
+        headSha: baseSha,
         cleaned: false,
       };
 
@@ -86,8 +112,9 @@ export class WorkspaceManager {
     fs.mkdirSync(workspacesDir, { recursive: true });
 
     const workspaceRoot = path.join(workspacesDir, taskId);
-    const branchName = `agent/${taskId}`;
+    assertPathContained(workspaceRoot, workspacesDir);
 
+    const branchName = `agent/${taskId}`;
     const baseSha = await this.gitService.getHeadSha(repoConfig.root);
 
     try {
@@ -113,6 +140,7 @@ export class WorkspaceManager {
       repositoryRoot: repoConfig.root,
       branchName,
       baseSha,
+      headSha: baseSha,
       cleaned: false,
     };
 
@@ -158,5 +186,34 @@ export class WorkspaceManager {
     }
 
     ws.cleaned = true;
+  }
+
+  public async pruneOldWorktrees(maxAgeMs = 86_400_000): Promise<number> {
+    const workspacesDir = path.join(this.dataDir, "workspaces");
+    if (!fs.existsSync(workspacesDir)) {
+      return 0;
+    }
+
+    let pruned = 0;
+    const entries = fs.readdirSync(workspacesDir, { withFileTypes: true });
+    const now = Date.now();
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(workspacesDir, entry.name);
+      if (this.activeWorkspaces.has(entry.name)) continue;
+
+      try {
+        const stats = fs.statSync(fullPath);
+        if (now - stats.mtimeMs > maxAgeMs) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+          pruned++;
+        }
+      } catch {
+        // Non-blocking prune error
+      }
+    }
+
+    return pruned;
   }
 }

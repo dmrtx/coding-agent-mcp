@@ -8,7 +8,6 @@ import {
   AgentProcessSpawnInfo,
 } from "../domain/agent.js";
 import { AgentConfig } from "../config/schema.js";
-import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 
 export class MuseAdapter implements CodingAgent {
   public readonly id = "muse";
@@ -59,16 +58,23 @@ export class MuseAdapter implements CodingAgent {
     const executable = this.config.executable || "muse";
     const sessionId = input.sessionId || crypto.randomUUID();
 
+    // Do NOT use --yolo: --yolo disables sandbox!
+    // Instead use --disable-approval and --approval-mode never so tool approvals are bypassed
+    // for headless execution while the OS/filesystem/network sandbox remains ACTIVE.
     const args: string[] = [
       "exec",
       "--workspace",
       input.workspaceRoot,
       "--approval-mode",
       "never",
-      "--yolo",
+      "--disable-approval",
       "--session-id",
       sessionId,
     ];
+
+    if (input.mode === "review" || input.mode === "investigate") {
+      args.push("--disable-write");
+    }
 
     if (this.config.extra_args && this.config.extra_args.length > 0) {
       args.push(...this.config.extra_args);
@@ -95,7 +101,7 @@ export class MuseAdapter implements CodingAgent {
       input.workspaceRoot,
       "--approval-mode",
       "never",
-      "--yolo",
+      "--disable-approval",
     ];
 
     if (sessionId) {
@@ -118,7 +124,6 @@ export class MuseAdapter implements CodingAgent {
   }
 
   public extractSessionId(stdout: string, stderr: string): string | undefined {
-    // Muse session ID matching if logged in output
     const match = stdout.match(/session[- ]id[:=\s]+([a-f0-9-]{36})/i);
     return match ? match[1] : undefined;
   }

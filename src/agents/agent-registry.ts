@@ -43,8 +43,21 @@ export class AgentRegistry {
     if (!agent) {
       throw new CodingAgentError(
         ErrorCodes.AGENT_NOT_AVAILABLE,
-        `Coding agent '${id}' is not registered or supported`,
+        `Coding agent '${id}' is not registered or configured`,
         { agent: id }
+      );
+    }
+    return agent;
+  }
+
+  public async validateAgentAvailable(id: string): Promise<CodingAgent> {
+    const agent = this.getAgent(id);
+    const desc = await agent.describe();
+    if (!desc.available) {
+      throw new CodingAgentError(
+        ErrorCodes.AGENT_NOT_AVAILABLE,
+        `Coding agent '${id}' is not currently available or enabled on this system`,
+        { agent: id, version: desc.version }
       );
     }
     return agent;

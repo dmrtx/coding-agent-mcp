@@ -27,6 +27,7 @@ export class TaskStore {
         mode TEXT NOT NULL,
         workspace_strategy TEXT NOT NULL,
         workspace_root TEXT NOT NULL,
+        base_sha TEXT,
         created_at TEXT NOT NULL,
         started_at TEXT,
         finished_at TEXT,
@@ -39,17 +40,24 @@ export class TaskStore {
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
     `);
+
+    // Ensure base_sha column exists if table was already created
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN base_sha TEXT;");
+    } catch {
+      // Column already exists
+    }
   }
 
   public saveTask(task: CodingTask): void {
     const stmt = this.db.prepare(`
       INSERT INTO tasks (
         id, repository_id, agent_id, status, instruction, follow_up_instructions,
-        mode, workspace_strategy, workspace_root, created_at, started_at, finished_at,
+        mode, workspace_strategy, workspace_root, base_sha, created_at, started_at, finished_at,
         session_id, workspace_id, exit_code, failure, log_path, session_resumable
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?
       )
       ON CONFLICT(id) DO UPDATE SET
@@ -74,6 +82,7 @@ export class TaskStore {
       task.mode,
       task.workspaceStrategy,
       task.workspaceRoot,
+      task.baseSha ?? null,
       task.createdAt,
       task.startedAt ?? null,
       task.finishedAt ?? null,
@@ -130,6 +139,7 @@ export class TaskStore {
       mode: row.mode as AgentTaskMode,
       workspaceStrategy: row.workspace_strategy as WorkspaceStrategy,
       workspaceRoot: row.workspace_root,
+      baseSha: row.base_sha ?? undefined,
       createdAt: row.created_at,
       startedAt: row.started_at ?? undefined,
       finishedAt: row.finished_at ?? undefined,

@@ -37,7 +37,10 @@ async function main() {
   const workspaceManager = new WorkspaceManager(config.server.data_dir, gitService);
   const repoRegistry = new RepositoryRegistry(config);
   const agentRegistry = new AgentRegistry(config);
-  const processManager = new ProcessManager(config.server.workspace_grace_period_ms);
+  const processManager = new ProcessManager(
+    config.server.workspace_grace_period_ms,
+    config.server.data_dir
+  );
   const verificationService = new VerificationService(
     config.server.default_task_timeout_seconds,
     config.server.output_limit_bytes
@@ -64,15 +67,19 @@ async function main() {
 
   const transport = new StdioServerTransport();
 
-  process.on("SIGINT", () => {
+  const shutdown = async () => {
+    console.error("[coding-agent-mcp] Shutting down, terminating active worker processes...");
+    try {
+      await processManager.shutdown();
+    } catch {
+      // Non-blocking shutdown error
+    }
     taskStore.close();
     process.exit(0);
-  });
+  };
 
-  process.on("SIGTERM", () => {
-    taskStore.close();
-    process.exit(0);
-  });
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   await server.connect(transport);
   console.error("[coding-agent-mcp] Server running on stdio");

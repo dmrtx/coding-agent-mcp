@@ -3,7 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { CodingTask, TaskStatus, TaskInstruction } from "../domain/task.js";
 import { AgentTaskMode } from "../domain/agent.js";
-import { WorkspaceStrategy } from "../domain/repository.js";
+import { WorkspaceStrategy, WorkspaceDescriptor } from "../domain/repository.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 import { RepositoryRegistry } from "../repositories/repository-registry.js";
 import { WorkspaceManager } from "../repositories/workspace-manager.js";
@@ -69,7 +69,9 @@ export class TaskManager {
     repository: string;
   }> {
     const repoConfig = this.repoRegistry.getRepository(params.repository);
-    const agent = this.agentRegistry.getAgent(params.agent);
+
+    // Validate agent availability BEFORE doing any workspace or task operations
+    const agent = await this.agentRegistry.validateAgentAvailable(params.agent);
 
     const activeCount = this.processManager.getRunningProcessCount();
     if (activeCount >= this.config.server.max_concurrent_tasks) {
@@ -83,96 +85,155 @@ export class TaskManager {
     const mode = params.mode ?? "implement";
     const workspaceStrategy = params.workspace_strategy ?? repoConfig.default_workspace_strategy;
 
-    const workspace = await this.workspaceManager.createWorkspace(
-      taskId,
-      params.repository,
-      repoConfig,
-      workspaceStrategy
-    );
+    let workspace: WorkspaceDescriptor | undefined;
+    let task: CodingTask | undefined;
 
-    this.auditStore.append({
-      type: "workspace.created",
-      taskId,
-      repositoryId: params.repository,
-      details: { strategy: workspace.strategy, root: workspace.workspaceRoot },
-    });
+    try {
+      workspace = await this.workspaceManager.createWorkspace(
+        taskId,
+        params.repository,
+        repoConfig,
+        workspaceStrategy
+      );
 
-    const logPath = path.join(this.config.server.data_dir, "logs", `${taskId}.log`);
-    const task: CodingTask = {
-      id: taskId,
-      repositoryId: params.repository,
-      agentId: params.agent,
-      status: "starting",
-      instruction: params.instruction,
-      followUpInstructions: [],
-      mode,
-      workspaceStrategy: workspace.strategy,
-      workspaceRoot: workspace.workspaceRoot,
-      createdAt: new Date().toISOString(),
-      logPath,
-      sessionResumable: true,
-    };
+      this.auditStore.append({
+        type: "workspace.created",
+        taskId,
+        repositoryId: params.repository,
+        details: { strategy: workspace.strategy, root: workspace.workspaceRoot },
+      });
 
-    this.taskStore.saveTask(task);
-    this.auditStore.append({
-      type: "task.created",
-      taskId,
-      repositoryId: params.repository,
-      agentId: params.agent,
-      details: { instruction: params.instruction, mode },
-    });
+      const logPath = path.join(this.config.server.data_dir, "logs", `${taskId}.log`);
+      task = {
+        id: taskId,
+        repositoryId: params.repository,
+        agentId: params.agent,
+        status: "starting",
+        instruction: params.instruction,
+        followUpInstructions: [],
+        mode,
+        workspaceStrategy: workspace.strategy,
+        workspaceRoot: workspace.workspaceRoot,
+        baseSha: workspace.baseSha,
+        createdAt: new Date().toISOString(),
+        logPath,
+        sessionResumable: true,
+      };
 
-    const agentConfig = this.config.agents[params.agent];
-    const env = sanitizeEnvironment(agentConfig?.env_allowlist);
-    const timeoutMs = (agentConfig?.default_timeout_seconds ?? this.config.server.default_task_timeout_seconds) * 1000;
+      this.taskStore.saveTask(task);
+      this.auditStore.append({
+        type: "task.created",
+        taskId,
+        repositoryId: params.repository,
+        agentId: params.agent,
+        details: { instruction: params.instruction, mode },
+      });
 
-    const spawnInfo = await agent.prepareStart({
-      taskId,
-      repositoryRoot: repoConfig.root,
-      workspaceRoot: workspace.workspaceRoot,
-      instruction: params.instruction,
-      mode,
-      timeoutMs,
-      environment: env,
-    });
+      const agentConfig = this.config.agents[params.agent];
+      const env = sanitizeEnvironment(agentConfig?.env_allowlist);
+      const timeoutMs =
+        (agentConfig?.default_timeout_seconds ?? this.config.server.default_task_timeout_seconds) * 1000;
 
-    task.sessionId = spawnInfo.sessionId;
-    task.startedAt = new Date().toISOString();
-    task.status = "running";
-    this.taskStore.saveTask(task);
+      const spawnInfo = await agent.prepareStart({
+        taskId,
+        repositoryRoot: repoConfig.root,
+        workspaceRoot: workspace.workspaceRoot,
+        instruction: params.instruction,
+        mode,
+        timeoutMs,
+        environment: env,
+      });
 
-    this.auditStore.append({
-      type: "task.started",
-      taskId,
-      agentId: params.agent,
-      details: { command: spawnInfo.command },
-    });
+      task.sessionId = spawnInfo.sessionId;
+      task.startedAt = new Date().toISOString();
+      task.status = "running";
+      this.taskStore.saveTask(task);
 
-    this.processManager.spawnProcess({
-      taskId,
-      command: spawnInfo.command,
-      args: spawnInfo.args,
-      cwd: spawnInfo.cwd,
-      env: spawnInfo.env,
-      timeoutMs,
-      logPath,
-      onExit: (code, signal, timedOut) => {
-        this.handleProcessExit(task, code, signal, timedOut);
-      },
-    });
+      this.auditStore.append({
+        type: "task.started",
+        taskId,
+        agentId: params.agent,
+        details: { command: spawnInfo.command },
+      });
 
-    this.auditStore.append({
-      type: "agent.process_spawned",
-      taskId,
-      agentId: params.agent,
-    });
+      this.processManager.spawnProcess({
+        taskId,
+        command: spawnInfo.command,
+        args: spawnInfo.args,
+        cwd: spawnInfo.cwd,
+        env: spawnInfo.env,
+        timeoutMs,
+        logPath,
+        maxOutputBytes: this.config.server.output_limit_bytes,
+        onOutput: (chunk: string) => {
+          if (!task!.sessionId && agent.extractSessionId) {
+            const extracted = agent.extractSessionId(chunk, "");
+            if (extracted) {
+              task!.sessionId = extracted;
+              task!.sessionResumable = true;
+              this.taskStore.saveTask(task!);
+            }
+          }
+        },
+        onOutputTruncated: () => {
+          this.auditStore.append({
+            type: "agent.output_truncated",
+            taskId: task!.id,
+            agentId: task!.agentId,
+          });
+        },
+        onExit: (code, signal, timedOut) => {
+          // Extract session ID from complete log if not yet captured
+          if (!task!.sessionId && agent.extractSessionId && fs.existsSync(task!.logPath)) {
+            try {
+              const fullLog = fs.readFileSync(task!.logPath, "utf-8");
+              const extracted = agent.extractSessionId(fullLog, "");
+              if (extracted) {
+                task!.sessionId = extracted;
+                task!.sessionResumable = true;
+              }
+            } catch {
+              // Non-blocking log reading
+            }
+          }
+          this.handleProcessExit(task!, code, signal, timedOut);
+        },
+      });
 
-    return {
-      task_id: taskId,
-      status: task.status,
-      agent: params.agent,
-      repository: params.repository,
-    };
+      this.auditStore.append({
+        type: "agent.process_spawned",
+        taskId,
+        agentId: params.agent,
+      });
+
+      return {
+        task_id: taskId,
+        status: task.status,
+        agent: params.agent,
+        repository: params.repository,
+      };
+    } catch (err) {
+      // Rollback on startup or spawn failure
+      if (workspace) {
+        try {
+          await this.workspaceManager.cleanupWorkspace(taskId);
+        } catch {
+          // Non-blocking cleanup
+        }
+      }
+
+      if (task) {
+        task.status = "failed";
+        task.finishedAt = new Date().toISOString();
+        task.failure = {
+          code: err instanceof CodingAgentError ? err.code : ErrorCodes.PROCESS_START_FAILED,
+          message: err instanceof Error ? err.message : String(err),
+        };
+        this.taskStore.saveTask(task);
+      }
+
+      throw err;
+    }
   }
 
   public async continueTask(params: ContinueTaskParams): Promise<{
@@ -197,12 +258,21 @@ export class TaskManager {
       );
     }
 
-    const agent = this.agentRegistry.getAgent(task.agentId);
+    // Validate agent availability
+    const agent = await this.agentRegistry.validateAgentAvailable(task.agentId);
     if (!agent.prepareContinue) {
       throw new CodingAgentError(
         ErrorCodes.TASK_NOT_RESUMABLE,
         `Agent '${task.agentId}' does not support task continuation`,
         { agent: task.agentId }
+      );
+    }
+
+    if (task.sessionResumable === false) {
+      throw new CodingAgentError(
+        ErrorCodes.TASK_NOT_RESUMABLE,
+        `Task '${params.task_id}' cannot be resumed (no valid session identifier was captured from previous execution)`,
+        { task_id: params.task_id }
       );
     }
 
@@ -214,58 +284,102 @@ export class TaskManager {
       );
     }
 
+    const previousStatus = task.status;
+    const previousFinishedAt = task.finishedAt;
+    const previousExitCode = task.exitCode;
+    const previousFailure = task.failure;
+
     const followUp: TaskInstruction = {
       id: crypto.randomUUID(),
       text: params.instruction,
       receivedAt: new Date().toISOString(),
     };
 
-    task.followUpInstructions.push(followUp);
-    task.status = "running";
-    task.startedAt = new Date().toISOString();
-    task.finishedAt = undefined;
-    task.exitCode = undefined;
-    task.failure = undefined;
+    try {
+      task.followUpInstructions.push(followUp);
+      task.status = "running";
+      task.startedAt = new Date().toISOString();
+      task.finishedAt = undefined;
+      task.exitCode = undefined;
+      task.failure = undefined;
 
-    this.taskStore.saveTask(task);
-    this.auditStore.append({
-      type: "task.instruction_added",
-      taskId: task.id,
-      agentId: task.agentId,
-      details: { instruction: params.instruction },
-    });
+      this.taskStore.saveTask(task);
+      this.auditStore.append({
+        type: "task.instruction_added",
+        taskId: task.id,
+        agentId: task.agentId,
+        details: { instruction: params.instruction },
+      });
 
-    const agentConfig = this.config.agents[task.agentId];
-    const env = sanitizeEnvironment(agentConfig?.env_allowlist);
-    const timeoutMs = (agentConfig?.default_timeout_seconds ?? this.config.server.default_task_timeout_seconds) * 1000;
+      const agentConfig = this.config.agents[task.agentId];
+      const env = sanitizeEnvironment(agentConfig?.env_allowlist);
+      const timeoutMs =
+        (agentConfig?.default_timeout_seconds ?? this.config.server.default_task_timeout_seconds) * 1000;
 
-    const spawnInfo = await agent.prepareContinue({
-      taskId: task.id,
-      workspaceRoot: task.workspaceRoot,
-      sessionId: task.sessionId,
-      instruction: params.instruction,
-      timeoutMs,
-      environment: env,
-    });
+      const spawnInfo = await agent.prepareContinue({
+        taskId: task.id,
+        workspaceRoot: task.workspaceRoot,
+        sessionId: task.sessionId,
+        instruction: params.instruction,
+        timeoutMs,
+        environment: env,
+      });
 
-    this.processManager.spawnProcess({
-      taskId: task.id,
-      command: spawnInfo.command,
-      args: spawnInfo.args,
-      cwd: spawnInfo.cwd,
-      env: spawnInfo.env,
-      timeoutMs,
-      logPath: task.logPath,
-      onExit: (code, signal, timedOut) => {
-        this.handleProcessExit(task, code, signal, timedOut);
-      },
-    });
+      this.processManager.spawnProcess({
+        taskId: task.id,
+        command: spawnInfo.command,
+        args: spawnInfo.args,
+        cwd: spawnInfo.cwd,
+        env: spawnInfo.env,
+        timeoutMs,
+        logPath: task.logPath,
+        maxOutputBytes: this.config.server.output_limit_bytes,
+        onOutput: (chunk: string) => {
+          if (agent.extractSessionId) {
+            const extracted = agent.extractSessionId(chunk, "");
+            if (extracted) {
+              task!.sessionId = extracted;
+              this.taskStore.saveTask(task!);
+            }
+          }
+        },
+        onOutputTruncated: () => {
+          this.auditStore.append({
+            type: "agent.output_truncated",
+            taskId: task!.id,
+            agentId: task!.agentId,
+          });
+        },
+        onExit: (code, signal, timedOut) => {
+          if (agent.extractSessionId && fs.existsSync(task!.logPath)) {
+            try {
+              const fullLog = fs.readFileSync(task!.logPath, "utf-8");
+              const extracted = agent.extractSessionId(fullLog, "");
+              if (extracted) {
+                task!.sessionId = extracted;
+              }
+            } catch {
+              // Non-blocking log reading
+            }
+          }
+          this.handleProcessExit(task!, code, signal, timedOut);
+        },
+      });
 
-    return {
-      task_id: task.id,
-      status: task.status,
-      instruction: params.instruction,
-    };
+      return {
+        task_id: task.id,
+        status: task.status,
+        instruction: params.instruction,
+      };
+    } catch (err) {
+      // Revert task status on continue failure
+      task.status = previousStatus;
+      task.finishedAt = previousFinishedAt;
+      task.exitCode = previousExitCode;
+      task.failure = previousFailure;
+      this.taskStore.saveTask(task);
+      throw err;
+    }
   }
 
   public getTask(taskId: string): CodingTask {
@@ -334,6 +448,15 @@ export class TaskManager {
 
   public async cancelTask(taskId: string): Promise<{ task_id: string; cancelled: boolean }> {
     const task = this.getTask(taskId);
+
+    // Enforce that task is currently running or starting
+    if (task.status !== "running" && task.status !== "starting") {
+      throw new CodingAgentError(
+        ErrorCodes.TASK_NOT_RUNNING,
+        `Task '${taskId}' cannot be cancelled because it is not currently running (status: ${task.status})`,
+        { task_id: taskId, status: task.status }
+      );
+    }
 
     this.auditStore.append({
       type: "task.cancel_requested",

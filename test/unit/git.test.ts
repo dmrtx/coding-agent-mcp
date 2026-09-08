@@ -8,53 +8,90 @@ import { GitService } from "../../src/repositories/git-service.js";
 import { WorkspaceManager } from "../../src/repositories/workspace-manager.js";
 import { RepositoryConfig } from "../../src/config/schema.js";
 
-function setupTestGitRepo(): string {
+function setupTestGitRepo(): { repoDir: string; baseSha: string } {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "git-test-repo-"));
   execSync("git init", { cwd: repoDir, stdio: "ignore" });
   execSync("git config user.name 'Test User'", { cwd: repoDir, stdio: "ignore" });
   execSync("git config user.email 'test@example.com'", { cwd: repoDir, stdio: "ignore" });
 
-  fs.writeFileSync(path.join(repoDir, "file1.txt"), "hello world\n");
+  fs.writeFileSync(path.join(repoDir, "file1.txt"), "line 1\n");
   execSync("git add file1.txt && git commit -m 'Initial commit'", {
     cwd: repoDir,
     stdio: "ignore",
   });
 
-  return repoDir;
+  const baseSha = execSync("git rev-parse HEAD", { cwd: repoDir }).toString().trim();
+  return { repoDir, baseSha };
 }
 
-test("GitService returns structured status and diff", async () => {
-  const repoDir = setupTestGitRepo();
+test("GitService returns structured status with base_sha and head_sha", async () => {
+  const { repoDir, baseSha } = setupTestGitRepo();
   const gitService = new GitService();
 
   // Initially clean
-  const cleanStatus = await gitService.getStatus(repoDir);
+  const cleanStatus = await gitService.getStatus(repoDir, baseSha);
   assert.equal(cleanStatus.clean, true);
+  assert.equal(cleanStatus.base_sha, baseSha);
+  assert.equal(cleanStatus.head_sha, baseSha);
   assert.equal(cleanStatus.files.length, 0);
 
-  // Modify file1.txt and add file2.txt
+  // Agent makes a commit
   fs.appendFileSync(path.join(repoDir, "file1.txt"), "line 2\n");
-  fs.writeFileSync(path.join(repoDir, "file2.txt"), "new file\n");
+  execSync("git commit -am 'Second commit'", { cwd: repoDir, stdio: "ignore" });
+  const headSha = execSync("git rev-parse HEAD", { cwd: repoDir }).toString().trim();
 
-  const modifiedStatus = await gitService.getStatus(repoDir);
-  assert.equal(modifiedStatus.clean, false);
-  const modifiedFile = modifiedStatus.files.find((f) => f.path.includes("file1.txt"));
-  const untrackedFile = modifiedStatus.files.find((f) => f.path.includes("file2.txt"));
-  assert.ok(modifiedFile);
-  assert.equal(modifiedFile.status, "modified");
-  assert.ok(untrackedFile);
-  assert.equal(untrackedFile.status, "untracked");
+  // Agent makes unstaged change and creates untracked file
+  fs.appendFileSync(path.join(repoDir, "file1.txt"), "line 3\n");
+  fs.writeFileSync(path.join(repoDir, "brand-new.txt"), "new file content\n");
 
-  // Diff
-  const diffResult = await gitService.getDiff(repoDir);
-  assert.ok(diffResult.diff.includes("line 2"));
+  const status = await gitService.getStatus(repoDir, baseSha);
+  assert.equal(status.clean, false);
+  assert.equal(status.base_sha, baseSha);
+  assert.equal(status.head_sha, headSha);
+  assert.notEqual(status.base_sha, status.head_sha);
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+});
+
+test("GitService task-aware diff includes committed changes, unstaged changes, and untracked files", async () => {
+  const { repoDir, baseSha } = setupTestGitRepo();
+  const gitService = new GitService();
+
+  // 1. Committed change since baseSha
+  fs.writeFileSync(path.join(repoDir, "committed.txt"), "committed line\n");
+  execSync("git add committed.txt && git commit -m 'Add committed.txt'", {
+    cwd: repoDir,
+    stdio: "ignore",
+  });
+
+  // 2. Unstaged tracked modification
+  fs.appendFileSync(path.join(repoDir, "file1.txt"), "unstaged line\n");
+
+  // 3. Untracked brand new file created by worker
+  fs.writeFileSync(path.join(repoDir, "untracked-by-agent.txt"), "untracked agent output\n");
+
+  // Run task-aware diff against baseSha
+  const diffResult = await gitService.getDiff(repoDir, {
+    baseSha,
+    includeUntracked: true,
+  });
+
+  assert.ok(diffResult.diff.includes("committed.txt"), "Diff must include changes committed since baseSha");
+  assert.ok(diffResult.diff.includes("committed line"));
+  assert.ok(diffResult.diff.includes("unstaged line"), "Diff must include unstaged changes");
+  assert.ok(diffResult.diff.includes("untracked-by-agent.txt"), "Diff must include untracked files");
+  assert.ok(diffResult.diff.includes("untracked agent output"));
+
+  assert.ok(diffResult.files_changed.includes("committed.txt"));
+  assert.ok(diffResult.files_changed.includes("file1.txt"));
+  assert.ok(diffResult.files_changed.includes("untracked-by-agent.txt"));
   assert.equal(diffResult.truncated, false);
 
   fs.rmSync(repoDir, { recursive: true, force: true });
 });
 
 test("WorkspaceManager creates and cleans up isolated worktree", async () => {
-  const repoDir = setupTestGitRepo();
+  const { repoDir } = setupTestGitRepo();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wm-data-"));
   const gitService = new GitService();
   const wm = new WorkspaceManager(dataDir, gitService);
@@ -62,6 +99,7 @@ test("WorkspaceManager creates and cleans up isolated worktree", async () => {
   const repoConfig: RepositoryConfig = {
     root: repoDir,
     writable: true,
+    allow_in_place: false,
     default_workspace_strategy: "worktree",
     verification_profiles: {},
   };
@@ -82,33 +120,56 @@ test("WorkspaceManager creates and cleans up isolated worktree", async () => {
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
-test("WorkspaceManager prevents concurrent in_place operations", async () => {
-  const repoDir = setupTestGitRepo();
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wm-inplace-"));
+test("WorkspaceManager enforces in_place security: allow_in_place check and dirty tree rejection", async () => {
+  const { repoDir } = setupTestGitRepo();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wm-inplace-sec-"));
   const gitService = new GitService();
   const wm = new WorkspaceManager(dataDir, gitService);
 
-  const repoConfig: RepositoryConfig = {
+  // 1. allow_in_place = false -> must reject
+  const disabledInPlaceConfig: RepositoryConfig = {
     root: repoDir,
     writable: true,
+    allow_in_place: false,
     default_workspace_strategy: "in_place",
     verification_profiles: {},
   };
 
-  await wm.createWorkspace("task-1", "test-repo", repoConfig, "in_place");
+  await assert.rejects(
+    () => wm.createWorkspace("task-dis", "test-repo", disabledInPlaceConfig, "in_place"),
+    (err: any) => err.code === "POLICY_DENIED"
+  );
+
+  // 2. allow_in_place = true BUT repository is dirty -> must reject
+  const allowedInPlaceConfig: RepositoryConfig = {
+    root: repoDir,
+    writable: true,
+    allow_in_place: true,
+    default_workspace_strategy: "in_place",
+    verification_profiles: {},
+  };
+
+  fs.appendFileSync(path.join(repoDir, "file1.txt"), "dirty uncommitted change\n");
 
   await assert.rejects(
-    () => wm.createWorkspace("task-2", "test-repo", repoConfig, "in_place"),
+    () => wm.createWorkspace("task-dirty", "test-repo", allowedInPlaceConfig, "in_place"),
     (err: any) => err.code === "WORKSPACE_CONFLICT"
   );
 
-  await wm.cleanupWorkspace("task-1");
+  // Reset clean state
+  execSync("git checkout -- file1.txt", { cwd: repoDir, stdio: "ignore" });
 
-  // Can now acquire again
-  const ws2 = await wm.createWorkspace("task-2", "test-repo", repoConfig, "in_place");
-  assert.equal(ws2.taskId, "task-2");
+  // 3. Clean and allowed -> succeeds
+  const ws = await wm.createWorkspace("task-clean", "test-repo", allowedInPlaceConfig, "in_place");
+  assert.equal(ws.strategy, "in_place");
 
-  await wm.cleanupWorkspace("task-2");
+  // 4. Concurrent in_place -> rejected
+  await assert.rejects(
+    () => wm.createWorkspace("task-second", "test-repo", allowedInPlaceConfig, "in_place"),
+    (err: any) => err.code === "WORKSPACE_CONFLICT"
+  );
+
+  await wm.cleanupWorkspace("task-clean");
 
   fs.rmSync(repoDir, { recursive: true, force: true });
   fs.rmSync(dataDir, { recursive: true, force: true });

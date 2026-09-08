@@ -6,6 +6,7 @@ export interface RepositoryDescriptor {
   defaultBranch?: string;
   verificationProfiles: string[];
   writable: boolean;
+  allow_in_place: boolean;
   defaultWorkspaceStrategy?: WorkspaceStrategy;
 }
 

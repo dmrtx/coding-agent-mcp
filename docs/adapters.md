@@ -12,12 +12,14 @@
 
 ### Headless Execution
 - When `start_task` is invoked:
-  `muse exec --workspace <workspaceRoot> --approval-mode never --yolo --session-id <uuid> "<instruction>"`
+  `muse exec --workspace <workspaceRoot> --approval-mode never --disable-approval --session-id <uuid> "<instruction>"`
+- Notice: `--yolo` is strictly **omitted** to retain Meta's shell/filesystem sandbox active.
+- If `mode` is `review` or `investigate`, `--disable-write` is added to prevent unintended workspace mutations.
 - Session ID is tracked for resumption and task continuation.
 
 ### Continuation
 - When `continue_task` is called:
-  `muse exec --workspace <workspaceRoot> --approval-mode never --yolo --session-id <uuid> "<instruction>"`
+  `muse exec --workspace <workspaceRoot> --approval-mode never --disable-approval --session-id <uuid> "<instruction>"`
 
 ---
 
@@ -29,13 +31,16 @@
 
 ### Headless Execution
 - When `start_task` is invoked:
-  `agy --print "<instruction>" --dangerously-skip-permissions`
+  `agy --print "<instruction>" --output-format json --sandbox --dangerously-skip-permissions`
   (executed with working directory set to the task workspace).
+- Notice: `--sandbox` is explicitly enabled to enforce terminal and filesystem sandbox restrictions.
+- `--output-format json` emits structured output from which the real `conversation_id` is parsed and stored.
+- If `mode` is `review` or `investigate`, `--mode plan` is added.
 
 ### Continuation
 - When `continue_task` is called:
-  `agy --print "<instruction>" --dangerously-skip-permissions --conversation <conversationId>`
-  (or `--continue`).
+  `agy --print "<instruction>" --output-format json --sandbox --dangerously-skip-permissions --conversation <conversationId>`
+  (or `--continue` if no conversation ID was captured).
 
 ---
 

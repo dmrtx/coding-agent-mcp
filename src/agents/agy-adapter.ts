@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import crypto from "node:crypto";
 import {
   CodingAgent,
   AgentDescriptor,
@@ -56,13 +55,23 @@ export class AgyAdapter implements CodingAgent {
 
   public async prepareStart(input: AgentStartInput): Promise<AgentProcessSpawnInfo> {
     const executable = this.config.executable || "agy";
-    const sessionId = input.sessionId || crypto.randomUUID();
 
+    // Launch with sandbox enabled and requesting json output to capture the real conversation_id
     const args: string[] = [
       "--print",
       input.instruction,
+      "--output-format",
+      "json",
       "--dangerously-skip-permissions",
     ];
+
+    if (this.config.sandbox !== false) {
+      args.push("--sandbox");
+    }
+
+    if (input.mode === "review" || input.mode === "investigate") {
+      args.push("--mode", "plan");
+    }
 
     if (this.config.extra_args && this.config.extra_args.length > 0) {
       args.push(...this.config.extra_args);
@@ -73,7 +82,7 @@ export class AgyAdapter implements CodingAgent {
       args,
       cwd: input.workspaceRoot,
       env: input.environment,
-      sessionId,
+      sessionId: undefined, // Will be extracted from real JSON output after run
     };
   }
 
@@ -83,8 +92,14 @@ export class AgyAdapter implements CodingAgent {
     const args: string[] = [
       "--print",
       input.instruction,
+      "--output-format",
+      "json",
       "--dangerously-skip-permissions",
     ];
+
+    if (this.config.sandbox !== false) {
+      args.push("--sandbox");
+    }
 
     if (input.sessionId) {
       args.push("--conversation", input.sessionId);
@@ -105,9 +120,43 @@ export class AgyAdapter implements CodingAgent {
     };
   }
 
-  public extractSessionId(stdout: string, stderr: string): string | undefined {
-    // AGY conversation ID matching if present
-    const match = stdout.match(/(?:conversation|session)[-_ ]id[:=\s]+([a-f0-9-]{8,36})/i);
-    return match ? match[1] : undefined;
+  public extractSessionId(stdout: string, _stderr: string): string | undefined {
+    if (!stdout || stdout.trim().length === 0) {
+      return undefined;
+    }
+
+    // 1. Try full JSON parse
+    try {
+      const parsed = JSON.parse(stdout.trim());
+      if (parsed.conversation_id) return String(parsed.conversation_id);
+      if (parsed.conversationId) return String(parsed.conversationId);
+      if (parsed.id) return String(parsed.id);
+      if (parsed.session_id) return String(parsed.session_id);
+    } catch {
+      // Not a single JSON blob; try lines
+    }
+
+    // 2. Try line-by-line JSON (stream-json or mixed logging)
+    const lines = stdout.split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+      try {
+        const item = JSON.parse(trimmed);
+        if (item.conversation_id) return String(item.conversation_id);
+        if (item.conversationId) return String(item.conversationId);
+        if (item.id) return String(item.id);
+      } catch {
+        // continue searching
+      }
+    }
+
+    // 3. Fallback regex search
+    const regexMatch = stdout.match(/(?:"conversation_id"|"conversationId")\s*:\s*"([^"]+)"/);
+    if (regexMatch) {
+      return regexMatch[1];
+    }
+
+    return undefined;
   }
 }
