@@ -52,6 +52,7 @@ export class TaskManager {
   private readonly processManager: ProcessManager;
   private readonly taskStore: TaskStore;
   private readonly auditStore: AuditStore;
+  private readonly inFlightManagedRuns = new Set<string>();
 
   constructor(
     config: AppConfig,
@@ -725,18 +726,24 @@ export class TaskManager {
     // Exceptions propagate to the startTask catch block, which performs
     // the legacy startup-failure path (slot release, workspace cleanup,
     // failed persistence). Structured results below return without throwing.
-    const result = await agent.runManagedStart!({
-      taskId: task.id,
-      repositoryRoot: opts.repositoryRoot,
-      workspaceRoot: task.workspaceRoot,
-      instruction: opts.instruction,
-      mode: opts.mode,
-      timeoutMs: opts.timeoutMs,
-      environment: opts.env,
-      onOutput: (text: string, isStderr?: boolean) => {
-        writer.write(text, isStderr ?? false);
-      },
-    });
+    this.inFlightManagedRuns.add(task.id);
+    let result: ManagedStartResult;
+    try {
+      result = await agent.runManagedStart!({
+        taskId: task.id,
+        repositoryRoot: opts.repositoryRoot,
+        workspaceRoot: task.workspaceRoot,
+        instruction: opts.instruction,
+        mode: opts.mode,
+        timeoutMs: opts.timeoutMs,
+        environment: opts.env,
+        onOutput: (text: string, isStderr?: boolean) => {
+          writer.write(text, isStderr ?? false);
+        },
+      });
+    } finally {
+      this.inFlightManagedRuns.delete(task.id);
+    }
 
     // Guard against an external settle (e.g. cancelTask) racing the await:
     // never overwrite a terminal state or emit a second terminal audit.
@@ -917,19 +924,25 @@ export class TaskManager {
     // A hook throw propagates to the continueTask catch block, which performs
     // the legacy handoff-failure path (slot release, follow-up pop, full
     // state restore, rethrow). Structured results below settle without throwing.
-    const result: ManagedContinueResult = await agent.runManagedContinue!({
-      taskId: task.id,
-      repositoryRoot: repoConfig.root,
-      workspaceRoot: task.workspaceRoot,
-      sessionId: task.sessionId as string,
-      instruction: opts.instruction,
-      mode: task.mode,
-      timeoutMs,
-      environment: env,
-      onOutput: (text: string, isStderr?: boolean) => {
-        writer.write(text, isStderr ?? false);
-      },
-    });
+    this.inFlightManagedRuns.add(task.id);
+    let result: ManagedContinueResult;
+    try {
+      result = await agent.runManagedContinue!({
+        taskId: task.id,
+        repositoryRoot: repoConfig.root,
+        workspaceRoot: task.workspaceRoot,
+        sessionId: task.sessionId as string,
+        instruction: opts.instruction,
+        mode: task.mode,
+        timeoutMs,
+        environment: env,
+        onOutput: (text: string, isStderr?: boolean) => {
+          writer.write(text, isStderr ?? false);
+        },
+      });
+    } finally {
+      this.inFlightManagedRuns.delete(task.id);
+    }
 
     // Guard against an external settle (e.g. cancelTask) racing the await:
     // never overwrite a terminal state or emit a second terminal audit.
