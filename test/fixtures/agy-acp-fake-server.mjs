@@ -61,12 +61,56 @@ function handleRequest(msg) {
         errorTo(id, -32002, `Unknown session: ${String(sessionId)}`);
         return;
       }
+      const promptText = typeof p.prompt === "string" ? p.prompt : "";
       sessions.get(sessionId).lastPrompt = typeof p.prompt === "string" ? p.prompt : null;
+      // Marker for empty output: complete end_turn with no assistant text
+      // and no permission round-trip (isolates INTERNAL_ERROR mapping).
+      if (promptText.includes("[[EMPTY_OUTPUT]]")) {
+        send({
+          jsonrpc: "2.0",
+          id,
+          result: { stopReason: "end_turn", sessionId },
+        });
+        return;
+      }
+      // Marker for write probe: request a contained edit permission; final
+      // permissionOutcome mirrors the client reply and assistant text is
+      // only included when allowed (deny requires no success text).
+      if (promptText.includes("[[WRITE_PROBE]]")) {
+        permissionCounter += 1;
+        const permId = permissionCounter;
+        pendingPrompts.set(permId, { origId: id, sessionId, kind: "write" });
+        send({
+          jsonrpc: "2.0",
+          id: permId,
+          method: "session/request_permission",
+          params: {
+            sessionId,
+            toolCall: { toolCallId: `tc-${permId}`, tool: "edit", paths: ["notes.md"] },
+            reason: "fake kernel probe: edit notes.md",
+          },
+        });
+        return;
+      }
+      // Default/read prompt: assistant text notification plus one
+      // in-workspace read permission; final end_turn mirrors the client
+      // allow/deny as permissionOutcome with non-empty assistant text.
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "fake assistant update: reading README.md" },
+          },
+        },
+      });
       // Emit one inbound permission request; the prompt result follows once
       // the client answers (allow, deny, or JSON-RPC error — all complete).
       permissionCounter += 1;
       const permId = permissionCounter;
-      pendingPrompts.set(permId, { origId: id, sessionId });
+      pendingPrompts.set(permId, { origId: id, sessionId, kind: "read" });
       send({
         jsonrpc: "2.0",
         id: permId,
@@ -134,10 +178,36 @@ function handleResponse(msg) {
   } else if (msg.result !== undefined) {
     outcome = "ok";
   }
+  if (pending.kind === "write") {
+    if (outcome === "allow") {
+      send({
+        jsonrpc: "2.0",
+        id: pending.origId,
+        result: {
+          stopReason: "end_turn",
+          sessionId: pending.sessionId,
+          permissionOutcome: outcome,
+          assistantText: "fake assistant completed write probe",
+        },
+      });
+    } else {
+      send({
+        jsonrpc: "2.0",
+        id: pending.origId,
+        result: { stopReason: "end_turn", sessionId: pending.sessionId, permissionOutcome: outcome },
+      });
+    }
+    return;
+  }
   send({
     jsonrpc: "2.0",
     id: pending.origId,
-    result: { stopReason: "end_turn", sessionId: pending.sessionId, permissionOutcome: outcome },
+    result: {
+      stopReason: "end_turn",
+      sessionId: pending.sessionId,
+      permissionOutcome: outcome,
+      assistantText: "fake assistant completed turn for read probe",
+    },
   });
 }
 
