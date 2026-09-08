@@ -92,6 +92,24 @@ export interface ManagedContinueInput {
 
 export type ManagedContinueResult = ManagedStartResult;
 
+export interface ManagedCancelInput {
+  taskId: string;
+  repositoryRoot: string;
+  workspaceRoot: string;
+  sessionId?: string;
+  mode: AgentTaskMode;
+  environment: Record<string, string>;
+  graceTimeoutMs: number;
+}
+
+export type ManagedCancelResult =
+  | { status: "acknowledged" }
+  | { status: "fallback" }
+  | {
+      status: "failed";
+      failure: { code: ErrorCode; message: string; details?: Record<string, unknown> };
+    };
+
 export interface CodingAgent {
   readonly id: string;
   readonly displayName: string;
@@ -109,4 +127,6 @@ export interface CodingAgent {
   runManagedStart?(input: ManagedStartInput): Promise<ManagedStartResult>;
 
   runManagedContinue?(input: ManagedContinueInput): Promise<ManagedContinueResult>;
+
+  cancelManagedTask?(input: ManagedCancelInput): Promise<ManagedCancelResult>;
 }
