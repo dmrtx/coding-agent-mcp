@@ -27,6 +27,7 @@ test("MuseAdapter constructs safe headless arguments without --yolo", async () =
 
   // Verify critical safety flags
   assert.ok(!spawnInfo.args.includes("--yolo"), "Muse must NOT be executed with --yolo (disables sandbox)");
+  assert.ok(spawnInfo.args.includes("--trust-workspace"), "Muse must use --trust-workspace to avoid interactive prompts");
   assert.ok(spawnInfo.args.includes("--disable-approval"), "Muse must use --disable-approval for headless execution");
   assert.ok(spawnInfo.args.includes("--approval-mode"), "Muse must specify approval-mode");
   assert.equal(spawnInfo.args[spawnInfo.args.indexOf("--approval-mode") + 1], "never");
@@ -37,7 +38,7 @@ test("MuseAdapter constructs safe headless arguments without --yolo", async () =
   );
   assert.ok(spawnInfo.args.includes("fix bug"));
 
-  // Review mode disables write
+  // Review mode disables write and shell
   const reviewSpawn = await adapter.prepareStart({
     taskId: "task-test-muse-review",
     repositoryRoot: "/repo",
@@ -47,7 +48,22 @@ test("MuseAdapter constructs safe headless arguments without --yolo", async () =
     timeoutMs: 60000,
     environment: {},
   });
-  assert.ok(reviewSpawn.args.includes("--disable-write"));
+  assert.ok(reviewSpawn.args.includes("--disable-write"), "Review mode must include --disable-write");
+  assert.ok(reviewSpawn.args.includes("--disable-shell"), "Review mode must include --disable-shell");
+
+  // Continuation preserves trust-workspace and session-id
+  const contSpawn = await adapter.prepareContinue({
+    taskId: "task-test-muse",
+    workspaceRoot: "/workspace",
+    sessionId: "11111111-2222-3333-4444-555555555555",
+    instruction: "follow-up fix",
+    mode: "review",
+    timeoutMs: 60000,
+    environment: {},
+  });
+  assert.ok(contSpawn.args.includes("--trust-workspace"));
+  assert.ok(contSpawn.args.includes("--disable-write"));
+  assert.ok(contSpawn.args.includes("--disable-shell"));
 });
 
 test("AgyAdapter constructs safe headless arguments with sandbox and json output", async () => {
@@ -90,12 +106,13 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
   assert.ok(reviewSpawn.args.includes("--mode"));
   assert.equal(reviewSpawn.args[reviewSpawn.args.indexOf("--mode") + 1], "plan");
 
-  // Continuation uses real conversation id
+  // Continuation uses real conversation id and does not use --continue
   const continueSpawn = await adapter.prepareContinue({
     taskId: "task-test-agy",
     workspaceRoot: "/workspace",
     sessionId: "conv-real-9999",
     instruction: "address review feedback",
+    mode: "review",
     timeoutMs: 60000,
     environment: {},
   });
@@ -103,6 +120,23 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
   assert.equal(
     continueSpawn.args[continueSpawn.args.indexOf("--conversation") + 1],
     "conv-real-9999"
+  );
+  assert.ok(!continueSpawn.args.includes("--continue"), "AGY continue must not fall back to global --continue");
+  assert.ok(continueSpawn.args.includes("--mode"));
+  assert.equal(continueSpawn.args[continueSpawn.args.indexOf("--mode") + 1], "plan");
+
+  // Continuation without sessionId is strictly rejected
+  await assert.rejects(
+    () =>
+      adapter.prepareContinue({
+        taskId: "task-test-agy",
+        workspaceRoot: "/workspace",
+        sessionId: undefined,
+        instruction: "address feedback",
+        timeoutMs: 60000,
+        environment: {},
+      }),
+    (err: any) => err.code === "TASK_NOT_RESUMABLE"
   );
 });
 

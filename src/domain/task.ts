@@ -43,4 +43,5 @@ export interface CodingTask {
   failure?: TaskFailure;
   logPath: string;
   sessionResumable?: boolean;
+  outputTruncated?: boolean;
 }

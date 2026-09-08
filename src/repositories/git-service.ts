@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { RepoGitStatus, GitFileStatus, GitDiffResult } from "../domain/repository.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
+import { assertPathContained } from "../security/path-policy.js";
 
 function execFilePromise(
   file: string,
@@ -103,7 +104,7 @@ export class GitService {
 
     const args = ["diff"];
     if (options.baseSha) {
-      // Diffs base commit against current working tree (including committed, staged, and unstaged tracked changes!)
+      // Diffs base commit against current working tree (including committed, staged, and unstaged tracked changes)
       args.push(options.baseSha);
     } else if (options.staged) {
       args.push("--staged");
@@ -131,7 +132,7 @@ export class GitService {
       // Fallback if baseSha or HEAD is empty
     }
 
-    // Include untracked files unless explicitly disabled
+    // Include untracked files safely
     if (options.includeUntracked !== false) {
       try {
         const { stdout: statusOut } = await execFilePromise(
@@ -145,34 +146,44 @@ export class GitService {
           if (line.startsWith("?? ")) {
             const relPath = line.slice(3).trim();
             const fullPath = path.join(cwd, relPath);
-            if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
-              filesChangedSet.add(relPath);
 
-              // Generate unified diff for untracked file using git diff --no-index
-              try {
-                const { stdout: untrackedDiff } = await execFilePromise(
-                  "git",
-                  ["diff", "--no-index", "--", "/dev/null", relPath],
-                  { cwd }
-                );
-                if (untrackedDiff) {
-                  if (combinedDiff.length > 0 && !combinedDiff.endsWith("\n")) {
-                    combinedDiff += "\n";
-                  }
-                  combinedDiff += untrackedDiff;
+            // Path containment and symlink escape prevention
+            try {
+              if (!fs.existsSync(fullPath)) continue;
+              const lstat = fs.lstatSync(fullPath);
+              if (lstat.isSymbolicLink()) {
+                // Reject/skip symlinks to prevent indirect outside reading
+                continue;
+              }
+              assertPathContained(fullPath, cwd);
+            } catch {
+              continue;
+            }
+
+            filesChangedSet.add(relPath);
+
+            // Generate unified diff for untracked file via git diff --no-index
+            try {
+              const { stdout: untrackedDiff } = await execFilePromise(
+                "git",
+                ["diff", "--no-index", "--", "/dev/null", relPath],
+                { cwd }
+              );
+              if (untrackedDiff) {
+                if (combinedDiff.length > 0 && !combinedDiff.endsWith("\n")) {
+                  combinedDiff += "\n";
                 }
-              } catch {
-                // Ignore diff generation failures for binary/empty files
-              }
+                combinedDiff += untrackedDiff;
 
-              // Count lines as insertions
-              try {
-                const content = fs.readFileSync(fullPath, "utf-8");
-                const lineCount = content.split("\n").length;
-                insertions += lineCount;
-              } catch {
-                // Ignore binary read error
+                // Count insertions directly from git diff output without Node readFileSync
+                for (const diffLine of untrackedDiff.split("\n")) {
+                  if (diffLine.startsWith("+") && !diffLine.startsWith("+++")) {
+                    insertions++;
+                  }
+                }
               }
+            } catch {
+              // Ignore diff generation failures for binary/empty files
             }
           }
         }

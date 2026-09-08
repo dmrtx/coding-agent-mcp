@@ -188,7 +188,7 @@ export class WorkspaceManager {
     ws.cleaned = true;
   }
 
-  public async pruneOldWorktrees(maxAgeMs = 86_400_000): Promise<number> {
+  public async pruneOldWorktrees(maxAgeMs = 86_400_000, repoRoots: string[] = []): Promise<number> {
     const workspacesDir = path.join(this.dataDir, "workspaces");
     if (!fs.existsSync(workspacesDir)) {
       return 0;
@@ -206,8 +206,64 @@ export class WorkspaceManager {
       try {
         const stats = fs.statSync(fullPath);
         if (now - stats.mtimeMs > maxAgeMs) {
-          fs.rmSync(fullPath, { recursive: true, force: true });
+          let repoRoot: string | undefined;
+          const gitFile = path.join(fullPath, ".git");
+          if (fs.existsSync(gitFile)) {
+            try {
+              const gitDirContent = fs.readFileSync(gitFile, "utf-8").trim();
+              const match = gitDirContent.match(/^gitdir:\s*(.*)$/m);
+              if (match && match[1]) {
+                const gitDir = path.resolve(fullPath, match[1]);
+                const commondirFile = path.join(gitDir, "commondir");
+                if (fs.existsSync(commondirFile)) {
+                  const commondir = fs.readFileSync(commondirFile, "utf-8").trim();
+                  const mainGitDir = path.resolve(gitDir, commondir);
+                  repoRoot = path.dirname(mainGitDir);
+                }
+              }
+            } catch {
+              // Ignore gitdir resolution error
+            }
+          }
+
+          if (repoRoot && fs.existsSync(repoRoot)) {
+            try {
+              await execFilePromise("git", ["worktree", "remove", "--force", fullPath], {
+                cwd: repoRoot,
+              });
+            } catch {
+              fs.rmSync(fullPath, { recursive: true, force: true });
+              try {
+                await execFilePromise("git", ["worktree", "prune"], { cwd: repoRoot });
+              } catch {
+                // Ignore worktree prune error
+              }
+            }
+
+            try {
+              await execFilePromise("git", ["branch", "-D", `agent/${entry.name}`], {
+                cwd: repoRoot,
+              });
+            } catch {
+              // Ignore branch deletion error
+            }
+          }
+
+          if (fs.existsSync(fullPath)) {
+            fs.rmSync(fullPath, { recursive: true, force: true });
+          }
+
           pruned++;
+        }
+      } catch {
+        // Non-blocking prune error
+      }
+    }
+
+    for (const repoRoot of repoRoots) {
+      try {
+        if (fs.existsSync(repoRoot)) {
+          await execFilePromise("git", ["worktree", "prune"], { cwd: repoRoot });
         }
       } catch {
         // Non-blocking prune error

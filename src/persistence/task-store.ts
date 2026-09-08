@@ -36,14 +36,21 @@ export class TaskStore {
         exit_code INTEGER,
         failure TEXT,
         log_path TEXT NOT NULL,
-        session_resumable INTEGER NOT NULL DEFAULT 0
+        session_resumable INTEGER NOT NULL DEFAULT 0,
+        output_truncated INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
     `);
 
-    // Ensure base_sha column exists if table was already created
+    // Ensure columns exist if table was already created
     try {
       this.db.exec("ALTER TABLE tasks ADD COLUMN base_sha TEXT;");
+    } catch {
+      // Column already exists
+    }
+
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN output_truncated INTEGER NOT NULL DEFAULT 0;");
     } catch {
       // Column already exists
     }
@@ -54,11 +61,11 @@ export class TaskStore {
       INSERT INTO tasks (
         id, repository_id, agent_id, status, instruction, follow_up_instructions,
         mode, workspace_strategy, workspace_root, base_sha, created_at, started_at, finished_at,
-        session_id, workspace_id, exit_code, failure, log_path, session_resumable
+        session_id, workspace_id, exit_code, failure, log_path, session_resumable, output_truncated
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?
       )
       ON CONFLICT(id) DO UPDATE SET
         status = excluded.status,
@@ -69,7 +76,8 @@ export class TaskStore {
         exit_code = excluded.exit_code,
         failure = excluded.failure,
         log_path = excluded.log_path,
-        session_resumable = excluded.session_resumable;
+        session_resumable = excluded.session_resumable,
+        output_truncated = excluded.output_truncated;
     `);
 
     stmt.run(
@@ -79,7 +87,7 @@ export class TaskStore {
       task.status,
       task.instruction,
       JSON.stringify(task.followUpInstructions),
-      task.mode,
+      task.mode ?? "implement",
       task.workspaceStrategy,
       task.workspaceRoot,
       task.baseSha ?? null,
@@ -91,7 +99,8 @@ export class TaskStore {
       task.exitCode ?? null,
       task.failure ? JSON.stringify(task.failure) : null,
       task.logPath,
-      task.sessionResumable ? 1 : 0
+      task.sessionResumable ? 1 : 0,
+      task.outputTruncated ? 1 : 0
     );
   }
 
@@ -149,6 +158,7 @@ export class TaskStore {
       failure: row.failure ? (JSON.parse(row.failure) as TaskFailure) : undefined,
       logPath: row.log_path,
       sessionResumable: Boolean(row.session_resumable),
+      outputTruncated: Boolean(row.output_truncated),
     };
   }
 

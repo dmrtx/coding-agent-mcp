@@ -7,6 +7,7 @@ import {
   AgentProcessSpawnInfo,
 } from "../domain/agent.js";
 import { AgentConfig } from "../config/schema.js";
+import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 
 export class AgyAdapter implements CodingAgent {
   public readonly id = "agy";
@@ -87,6 +88,13 @@ export class AgyAdapter implements CodingAgent {
   }
 
   public async prepareContinue(input: AgentContinueInput): Promise<AgentProcessSpawnInfo> {
+    if (!input.sessionId) {
+      throw new CodingAgentError(
+        ErrorCodes.TASK_NOT_RESUMABLE,
+        "Cannot continue AGY task: no valid conversation_id was captured from previous execution. Blind continuation is prohibited."
+      );
+    }
+
     const executable = this.config.executable || "agy";
 
     const args: string[] = [
@@ -94,6 +102,8 @@ export class AgyAdapter implements CodingAgent {
       input.instruction,
       "--output-format",
       "json",
+      "--conversation",
+      input.sessionId,
       "--dangerously-skip-permissions",
     ];
 
@@ -101,10 +111,8 @@ export class AgyAdapter implements CodingAgent {
       args.push("--sandbox");
     }
 
-    if (input.sessionId) {
-      args.push("--conversation", input.sessionId);
-    } else {
-      args.push("--continue");
+    if (input.mode === "review" || input.mode === "investigate") {
+      args.push("--mode", "plan");
     }
 
     if (this.config.extra_args && this.config.extra_args.length > 0) {

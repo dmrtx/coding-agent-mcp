@@ -35,12 +35,23 @@ async function main() {
   const auditStore = new AuditStore(config.server.data_dir);
   const gitService = new GitService();
   const workspaceManager = new WorkspaceManager(config.server.data_dir, gitService);
+
+  // Prune any stale worktrees older than 24 hours on startup
+  try {
+    const prunedCount = await workspaceManager.pruneOldWorktrees(
+      86_400_000,
+      Object.values(config.repositories).map((r) => r.root)
+    );
+    if (prunedCount > 0) {
+      console.error(`[coding-agent-mcp] Pruned ${prunedCount} stale worktrees on startup.`);
+    }
+  } catch {
+    // Non-blocking prune error
+  }
+
   const repoRegistry = new RepositoryRegistry(config);
   const agentRegistry = new AgentRegistry(config);
-  const processManager = new ProcessManager(
-    config.server.workspace_grace_period_ms,
-    config.server.data_dir
-  );
+  const processManager = new ProcessManager(config.server.workspace_grace_period_ms);
   const verificationService = new VerificationService(
     config.server.default_task_timeout_seconds,
     config.server.output_limit_bytes

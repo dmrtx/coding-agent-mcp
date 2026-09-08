@@ -174,3 +174,65 @@ test("WorkspaceManager enforces in_place security: allow_in_place check and dirt
   fs.rmSync(repoDir, { recursive: true, force: true });
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
+
+test("GitService safely ignores untracked symlinks pointing outside repository", async () => {
+  const { repoDir, baseSha } = setupTestGitRepo();
+  const gitService = new GitService();
+
+  const secretDir = fs.mkdtempSync(path.join(os.tmpdir(), "secret-dir-"));
+  fs.writeFileSync(path.join(secretDir, "secret.txt"), "super-secret-password-123\n");
+
+  // Create untracked symlink pointing to secret file outside repo
+  fs.symlinkSync(path.join(secretDir, "secret.txt"), path.join(repoDir, "leak-symlink.txt"));
+
+  const diffResult = await gitService.getDiff(repoDir, {
+    baseSha,
+    includeUntracked: true,
+  });
+
+  assert.ok(!diffResult.diff.includes("super-secret-password-123"), "Symlink targets outside repo must NOT be exposed in diff");
+  assert.ok(!diffResult.files_changed.includes("leak-symlink.txt"), "Symlink should not be in files_changed");
+
+  fs.rmSync(secretDir, { recursive: true, force: true });
+  fs.rmSync(repoDir, { recursive: true, force: true });
+});
+
+test("WorkspaceManager.pruneOldWorktrees removes stale worktrees and deletes git branches", async () => {
+  const { repoDir } = setupTestGitRepo();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wm-prune-data-"));
+  const gitService = new GitService();
+  const wm = new WorkspaceManager(dataDir, gitService);
+
+  const repoConfig: RepositoryConfig = {
+    root: repoDir,
+    writable: true,
+    allow_in_place: false,
+    default_workspace_strategy: "worktree",
+    verification_profiles: {},
+  };
+
+  const ws = await wm.createWorkspace("stale-task-1", "test-repo", repoConfig, "worktree");
+  assert.ok(fs.existsSync(ws.workspaceRoot));
+
+  // Verify branch exists in git repo
+  const branchesBefore = execSync("git branch", { cwd: repoDir }).toString();
+  assert.ok(branchesBefore.includes("agent/stale-task-1"));
+
+  // Pretend task ended and server restarted (activeWorkspaces cleared)
+  const wmRestarted = new WorkspaceManager(dataDir, gitService);
+
+  // Set mtime to 2 days ago
+  const twoDaysAgo = (Date.now() - 2 * 86_400_000) / 1000;
+  fs.utimesSync(ws.workspaceRoot, twoDaysAgo, twoDaysAgo);
+
+  const pruned = await wmRestarted.pruneOldWorktrees(86_400_000, [repoDir]);
+  assert.equal(pruned, 1);
+  assert.ok(!fs.existsSync(ws.workspaceRoot));
+
+  // Verify git branch was removed
+  const branchesAfter = execSync("git branch", { cwd: repoDir }).toString();
+  assert.ok(!branchesAfter.includes("agent/stale-task-1"));
+
+  fs.rmSync(repoDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});

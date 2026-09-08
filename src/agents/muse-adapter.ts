@@ -58,13 +58,14 @@ export class MuseAdapter implements CodingAgent {
     const executable = this.config.executable || "muse";
     const sessionId = input.sessionId || crypto.randomUUID();
 
-    // Do NOT use --yolo: --yolo disables sandbox!
-    // Instead use --disable-approval and --approval-mode never so tool approvals are bypassed
-    // for headless execution while the OS/filesystem/network sandbox remains ACTIVE.
+    // Do NOT use --yolo: --yolo disables the sandbox!
+    // Instead use --trust-workspace and --disable-approval with --approval-mode never
+    // so approvals are bypassed for headless execution while the OS/filesystem/network sandbox remains ACTIVE.
     const args: string[] = [
       "exec",
       "--workspace",
       input.workspaceRoot,
+      "--trust-workspace",
       "--approval-mode",
       "never",
       "--disable-approval",
@@ -73,7 +74,8 @@ export class MuseAdapter implements CodingAgent {
     ];
 
     if (input.mode === "review" || input.mode === "investigate") {
-      args.push("--disable-write");
+      // For true read-only review, disable both non-shell writes and shell execution
+      args.push("--disable-write", "--disable-shell");
     }
 
     if (this.config.extra_args && this.config.extra_args.length > 0) {
@@ -99,6 +101,7 @@ export class MuseAdapter implements CodingAgent {
       "exec",
       "--workspace",
       input.workspaceRoot,
+      "--trust-workspace",
       "--approval-mode",
       "never",
       "--disable-approval",
@@ -106,6 +109,10 @@ export class MuseAdapter implements CodingAgent {
 
     if (sessionId) {
       args.push("--session-id", sessionId);
+    }
+
+    if (input.mode === "review" || input.mode === "investigate") {
+      args.push("--disable-write", "--disable-shell");
     }
 
     if (this.config.extra_args && this.config.extra_args.length > 0) {

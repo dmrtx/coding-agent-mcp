@@ -32,6 +32,10 @@ class FailingAgent implements CodingAgent {
   async prepareStart(_input: AgentStartInput): Promise<AgentProcessSpawnInfo> {
     throw new Error("Simulated agent preparation error");
   }
+
+  async prepareContinue(_input: any): Promise<AgentProcessSpawnInfo> {
+    throw new Error("Simulated continue agent error");
+  }
 }
 
 function setupRollbackEnvironment() {
@@ -74,7 +78,7 @@ function setupRollbackEnvironment() {
   const workspaceManager = new WorkspaceManager(dataDir, gitService);
   const repoRegistry = new RepositoryRegistry(config);
   const agentRegistry = new AgentRegistry(config);
-  const processManager = new ProcessManager(1000, dataDir);
+  const processManager = new ProcessManager(1000);
 
   agentRegistry.registerAgent(new FailingAgent());
 
@@ -126,6 +130,51 @@ test("TaskManager rolls back workspace when agent startup fails", async () => {
     assert.equal(tasks.length, 1);
     assert.equal(tasks[0].status, "failed");
     assert.ok(tasks[0].failure?.message.includes("Simulated agent preparation error"));
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("TaskManager rolls back task state and followUpInstructions when continueTask fails", async () => {
+  const env = setupRollbackEnvironment();
+
+  try {
+    // Manually insert a completed task into the taskStore
+    const fakeTask = {
+      id: "task-rollback-continue",
+      repositoryId: "test-repo",
+      agentId: "failing-agent",
+      status: "completed" as const,
+      instruction: "initial instruction",
+      followUpInstructions: [],
+      mode: "implement" as const,
+      workspaceStrategy: "worktree" as const,
+      workspaceRoot: env.tmpDir,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      startedAt: "2026-01-01T00:00:01.000Z",
+      finishedAt: "2026-01-01T00:00:05.000Z",
+      exitCode: 0,
+      logPath: path.join(env.dataDir, "task.log"),
+      sessionResumable: true,
+      sessionId: "session-123",
+    };
+    env.taskStore.saveTask(fakeTask);
+
+    await assert.rejects(
+      () =>
+        env.taskManager.continueTask({
+          task_id: fakeTask.id,
+          instruction: "do something that will fail",
+        }),
+      /Simulated continue agent error/
+    );
+
+    // Verify rollback: task is back to completed, exitCode is 0, followUpInstructions was popped
+    const restored = env.taskStore.getTask(fakeTask.id);
+    assert.ok(restored);
+    assert.equal(restored.status, "completed");
+    assert.equal(restored.exitCode, 0);
+    assert.equal(restored.followUpInstructions.length, 0);
   } finally {
     env.cleanup();
   }

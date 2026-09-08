@@ -163,6 +163,7 @@ test("MCP Client can call all 10 tools end-to-end", async () => {
     const getTaskData = JSON.parse((getTaskResult.content as any)[0].text);
     assert.equal(getTaskData.task_id, taskId);
     assert.equal(getTaskData.status, "completed");
+    assert.equal(typeof getTaskData.output_truncated, "boolean");
 
     // 5. get_task_output
     const outputResult = await client.callTool({
@@ -171,6 +172,9 @@ test("MCP Client can call all 10 tools end-to-end", async () => {
     });
     const outputData = JSON.parse((outputResult.content as any)[0].text);
     assert.ok(outputData.output.includes("FakeAgent started"));
+    assert.equal(typeof outputData.has_more, "boolean");
+    assert.equal(typeof outputData.source_truncated, "boolean");
+    assert.equal(outputData.has_more, false);
 
     // 6. get_repo_status
     const repoStatusResult = await client.callTool({

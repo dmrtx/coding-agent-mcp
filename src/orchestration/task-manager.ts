@@ -31,6 +31,8 @@ export interface TaskOutputResult {
   task_id: string;
   cursor: number;
   output: string;
+  has_more: boolean;
+  source_truncated: boolean;
   truncated: boolean;
   total_bytes: number;
 }
@@ -117,7 +119,9 @@ export class TaskManager {
         baseSha: workspace.baseSha,
         createdAt: new Date().toISOString(),
         logPath,
-        sessionResumable: true,
+        // Agents that return sessions dynamically (like AGY) start as non-resumable until extracted
+        sessionResumable: params.agent === "agy" ? false : true,
+        outputTruncated: false,
       };
 
       this.taskStore.saveTask(task);
@@ -144,7 +148,10 @@ export class TaskManager {
         environment: env,
       });
 
-      task.sessionId = spawnInfo.sessionId;
+      if (spawnInfo.sessionId) {
+        task.sessionId = spawnInfo.sessionId;
+        task.sessionResumable = true;
+      }
       task.startedAt = new Date().toISOString();
       task.status = "running";
       this.taskStore.saveTask(task);
@@ -176,6 +183,8 @@ export class TaskManager {
           }
         },
         onOutputTruncated: () => {
+          task!.outputTruncated = true;
+          this.taskStore.saveTask(task!);
           this.auditStore.append({
             type: "agent.output_truncated",
             taskId: task!.id,
@@ -191,10 +200,14 @@ export class TaskManager {
               if (extracted) {
                 task!.sessionId = extracted;
                 task!.sessionResumable = true;
+              } else {
+                task!.sessionResumable = false;
               }
             } catch {
-              // Non-blocking log reading
+              task!.sessionResumable = false;
             }
+          } else if (!task!.sessionId && params.agent === "agy") {
+            task!.sessionResumable = false;
           }
           this.handleProcessExit(task!, code, signal, timedOut);
         },
@@ -268,10 +281,10 @@ export class TaskManager {
       );
     }
 
-    if (task.sessionResumable === false) {
+    if (!task.sessionResumable || !task.sessionId) {
       throw new CodingAgentError(
         ErrorCodes.TASK_NOT_RESUMABLE,
-        `Task '${params.task_id}' cannot be resumed (no valid session identifier was captured from previous execution)`,
+        `Task '${params.task_id}' cannot be resumed (no valid session identifier was captured from initial execution)`,
         { task_id: params.task_id }
       );
     }
@@ -285,6 +298,7 @@ export class TaskManager {
     }
 
     const previousStatus = task.status;
+    const previousStartedAt = task.startedAt;
     const previousFinishedAt = task.finishedAt;
     const previousExitCode = task.exitCode;
     const previousFailure = task.failure;
@@ -316,11 +330,13 @@ export class TaskManager {
       const timeoutMs =
         (agentConfig?.default_timeout_seconds ?? this.config.server.default_task_timeout_seconds) * 1000;
 
+      // Pass task.mode to prepareContinue so safety flags (--disable-write, --disable-shell, --mode plan) are preserved
       const spawnInfo = await agent.prepareContinue({
         taskId: task.id,
         workspaceRoot: task.workspaceRoot,
         sessionId: task.sessionId,
         instruction: params.instruction,
+        mode: task.mode,
         timeoutMs,
         environment: env,
       });
@@ -344,6 +360,8 @@ export class TaskManager {
           }
         },
         onOutputTruncated: () => {
+          task!.outputTruncated = true;
+          this.taskStore.saveTask(task!);
           this.auditStore.append({
             type: "agent.output_truncated",
             taskId: task!.id,
@@ -372,7 +390,9 @@ export class TaskManager {
         instruction: params.instruction,
       };
     } catch (err) {
-      // Revert task status on continue failure
+      // Complete rollback on continue failure: remove the unexecuted instruction and restore previous timestamps/status
+      task.followUpInstructions.pop();
+      task.startedAt = previousStartedAt;
       task.status = previousStatus;
       task.finishedAt = previousFinishedAt;
       task.exitCode = previousExitCode;
@@ -406,7 +426,9 @@ export class TaskManager {
         task_id: taskId,
         cursor: 0,
         output: "",
-        truncated: false,
+        has_more: false,
+        source_truncated: Boolean(task.outputTruncated),
+        truncated: Boolean(task.outputTruncated),
         total_bytes: 0,
       };
     }
@@ -419,7 +441,9 @@ export class TaskManager {
         task_id: taskId,
         cursor: totalBytes,
         output: "",
-        truncated: false,
+        has_more: false,
+        source_truncated: Boolean(task.outputTruncated),
+        truncated: Boolean(task.outputTruncated),
         total_bytes: totalBytes,
       };
     }
@@ -435,13 +459,16 @@ export class TaskManager {
     }
 
     const nextCursor = cursor + readLength;
-    const truncated = nextCursor < totalBytes;
+    const hasMore = nextCursor < totalBytes;
+    const sourceTruncated = Boolean(task.outputTruncated);
 
     return {
       task_id: taskId,
       cursor: nextCursor,
       output: buffer.toString("utf-8"),
-      truncated,
+      has_more: hasMore,
+      source_truncated: sourceTruncated,
+      truncated: hasMore || sourceTruncated,
       total_bytes: totalBytes,
     };
   }

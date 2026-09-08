@@ -7,7 +7,7 @@ import { ProcessManager } from "../../src/orchestration/process-manager.js";
 
 test("ProcessManager shutdown terminates all active worker process groups", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-shutdown-test-"));
-  const pm = new ProcessManager(1000, tmpDir);
+  const pm = new ProcessManager(1000);
 
   const log1 = path.join(tmpDir, "task1.log");
   const log2 = path.join(tmpDir, "task2.log");
@@ -46,7 +46,7 @@ test("ProcessManager shutdown terminates all active worker process groups", asyn
 
 test("ProcessManager cleans up timers and doesn't fire forceKill on early exit", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-timer-test-"));
-  const pm = new ProcessManager(2000, tmpDir);
+  const pm = new ProcessManager(2000);
   const log = path.join(tmpDir, "task.log");
 
   let exited = false;
@@ -75,7 +75,7 @@ test("ProcessManager cleans up timers and doesn't fire forceKill on early exit",
 
 test("ProcessManager bounds output and writes separate stdout/stderr files", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-output-test-"));
-  const pm = new ProcessManager(1000, tmpDir);
+  const pm = new ProcessManager(1000);
   const log = path.join(tmpDir, "task-output.log");
 
   let truncated = false;

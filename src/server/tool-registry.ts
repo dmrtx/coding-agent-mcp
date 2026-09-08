@@ -162,6 +162,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
           base_sha: task.baseSha,
           failure: task.failure,
           workspace_strategy: task.workspaceStrategy,
+          output_truncated: Boolean(task.outputTruncated),
         };
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

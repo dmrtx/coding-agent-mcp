@@ -36,14 +36,9 @@ export interface ActiveProcess {
 export class ProcessManager {
   private readonly activeProcesses: Map<string, ActiveProcess> = new Map();
   private readonly gracePeriodMs: number;
-  private readonly pidFilePath?: string;
 
-  constructor(gracePeriodMs = 3000, dataDir?: string) {
+  constructor(gracePeriodMs = 3000) {
     this.gracePeriodMs = gracePeriodMs;
-    if (dataDir) {
-      this.pidFilePath = path.join(dataDir, "active-pids.json");
-      this.cleanupDanglingPids();
-    }
   }
 
   public spawnProcess(options: SpawnProcessOptions): number {
@@ -99,7 +94,6 @@ export class ProcessManager {
     };
 
     this.activeProcesses.set(options.taskId, active);
-    this.saveActivePids();
 
     const handleChunk = (data: Buffer, isStderr: boolean) => {
       const text = data.toString("utf-8");
@@ -136,7 +130,7 @@ export class ProcessManager {
         active.timedOut = true;
         this.killProcessTree(pid, "SIGTERM");
 
-        // Safe force kill timer with verification of PID identity
+        // Safe force kill timer verifying active process identity before killing
         active.forceKillTimer = setTimeout(() => {
           const current = this.activeProcesses.get(options.taskId);
           if (current && current.pid === pid) {
@@ -159,7 +153,6 @@ export class ProcessManager {
       stderrStream.end();
 
       this.activeProcesses.delete(options.taskId);
-      this.saveActivePids();
 
       if (options.onExit) {
         options.onExit(code, signal, active.timedOut);
@@ -182,7 +175,7 @@ export class ProcessManager {
     // Graceful termination
     this.killProcessTree(active.pid, "SIGTERM");
 
-    // After grace period, force SIGKILL if still running
+    // After grace period, force SIGKILL only if this exact active process is still running
     await new Promise((resolve) => setTimeout(resolve, this.gracePeriodMs));
 
     const current = this.activeProcesses.get(taskId);
@@ -194,18 +187,20 @@ export class ProcessManager {
   }
 
   public async shutdown(): Promise<void> {
-    const pids = Array.from(this.activeProcesses.values()).map((a) => a.pid);
-
+    // 1. Send SIGTERM gracefully to all active processes
     for (const active of this.activeProcesses.values()) {
       if (active.timeoutTimer) clearTimeout(active.timeoutTimer);
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
       this.killProcessTree(active.pid, "SIGTERM");
     }
 
-    if (pids.length > 0) {
+    // 2. Wait grace period
+    if (this.activeProcesses.size > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.gracePeriodMs));
-      for (const pid of pids) {
-        this.killProcessTree(pid, "SIGKILL");
+
+      // 3. Force kill ONLY processes that are STILL actively registered in this.activeProcesses
+      for (const active of this.activeProcesses.values()) {
+        this.killProcessTree(active.pid, "SIGKILL");
       }
     }
 
@@ -216,7 +211,6 @@ export class ProcessManager {
     }
 
     this.activeProcesses.clear();
-    this.saveActivePids();
   }
 
   public isProcessRunning(taskId: string): boolean {
@@ -236,37 +230,6 @@ export class ProcessManager {
       } catch {
         // Process might have exited already
       }
-    }
-  }
-
-  private saveActivePids(): void {
-    if (!this.pidFilePath) return;
-    try {
-      const pids = Array.from(this.activeProcesses.values()).map((a) => ({
-        taskId: a.taskId,
-        pid: a.pid,
-      }));
-      fs.writeFileSync(this.pidFilePath, JSON.stringify(pids), "utf-8");
-    } catch {
-      // Non-blocking pid file write error
-    }
-  }
-
-  private cleanupDanglingPids(): void {
-    if (!this.pidFilePath || !fs.existsSync(this.pidFilePath)) return;
-    try {
-      const raw = fs.readFileSync(this.pidFilePath, "utf-8");
-      const pids: Array<{ taskId: string; pid: number }> = JSON.parse(raw);
-      for (const item of pids) {
-        try {
-          this.killProcessTree(item.pid, "SIGKILL");
-        } catch {
-          // Process was already dead
-        }
-      }
-      fs.unlinkSync(this.pidFilePath);
-    } catch {
-      // Non-blocking cleanup error
     }
   }
 }

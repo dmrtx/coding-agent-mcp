@@ -31,6 +31,7 @@ export interface AgentContinueInput {
   workspaceRoot: string;
   sessionId?: string;
   instruction: string;
+  mode: AgentTaskMode;
   timeoutMs: number;
   environment: Record<string, string>;
 }
