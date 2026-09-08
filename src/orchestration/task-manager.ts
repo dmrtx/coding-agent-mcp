@@ -560,6 +560,21 @@ export class TaskManager {
       stopped = await this.processManager.cancelProcess(taskId);
     }
 
+    // The managed stop awaited above can race the managed run settling on
+    // its own (e.g. cooperative cancel): never overwrite a terminal state
+    // or emit a second terminal audit.
+    const stored = this.taskStore.getTask(taskId);
+    if (
+      stored &&
+      stored.status !== "running" &&
+      stored.status !== "starting"
+    ) {
+      return {
+        task_id: taskId,
+        cancelled: stopped,
+      };
+    }
+
     if (task.workspaceStrategy === "in_place") {
       try {
         await this.workspaceManager.cleanupWorkspace(taskId);
