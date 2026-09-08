@@ -524,7 +524,42 @@ export class TaskManager {
       agentId: task.agentId,
     });
 
-    const stopped = await this.processManager.cancelProcess(taskId);
+    let stopped: boolean;
+    if (this.inFlightManagedRuns.has(task.id)) {
+      let agent: CodingAgent | undefined;
+      try {
+        agent = this.agentRegistry.getAgent(task.agentId);
+      } catch {
+        agent = undefined;
+      }
+      if (agent?.cancelManagedTask) {
+        try {
+          const repoConfig = this.repoRegistry.getRepository(task.repositoryId);
+          const agentConfig = this.config.agents[task.agentId];
+          const managedResult = await agent.cancelManagedTask({
+            taskId: task.id,
+            repositoryRoot: repoConfig.root,
+            workspaceRoot: task.workspaceRoot,
+            sessionId: task.sessionId,
+            mode: task.mode,
+            environment: sanitizeEnvironment(agentConfig?.env_allowlist),
+            graceTimeoutMs: this.config.server.workspace_grace_period_ms ?? 3000,
+          });
+          if (managedResult.status === "acknowledged") {
+            stopped = true;
+          } else {
+            stopped = await this.processManager.cancelProcess(taskId);
+          }
+        } catch {
+          stopped = await this.processManager.cancelProcess(taskId);
+        }
+      } else {
+        stopped = await this.processManager.cancelProcess(taskId);
+      }
+    } else {
+      stopped = await this.processManager.cancelProcess(taskId);
+    }
+
     if (task.workspaceStrategy === "in_place") {
       try {
         await this.workspaceManager.cleanupWorkspace(taskId);
