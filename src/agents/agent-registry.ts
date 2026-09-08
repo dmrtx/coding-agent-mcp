@@ -1,7 +1,8 @@
 import { CodingAgent, AgentDescriptor } from "../domain/agent.js";
-import { AppConfig } from "../config/schema.js";
+import { AppConfig, AgyAcpConfig } from "../config/schema.js";
 import { MuseAdapter } from "./muse-adapter.js";
 import { AgyAdapter } from "./agy-adapter.js";
+import { AgyAcpAdapter } from "./agy-acp-adapter.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 
 export class AgentRegistry {
@@ -13,6 +14,12 @@ export class AgentRegistry {
     }
     if (config.agents.agy) {
       this.registerAgent(new AgyAdapter(config.agents.agy, config.server?.data_dir));
+    }
+    // Phase 2A slice 1: `agy-acp` is opt-in and registered ONLY when
+    // explicitly enabled. Legacy `muse`/`agy` handling above is unchanged.
+    const agyAcp = (config.agents as Record<string, AgyAcpConfig | undefined>)["agy-acp"];
+    if (agyAcp?.enabled === true) {
+      this.registerAgent(new AgyAcpAdapter(agyAcp));
     }
   }
 
