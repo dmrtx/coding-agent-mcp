@@ -141,6 +141,31 @@ export function assertDataDirDisjointFromRepositories(
 }
 
 /**
+ * Rejects an `agents.agy-acp.state_dir` that is equal to, inside, or
+ * contains any configured repository root. Runtime agent state (sessions,
+ * credentials, transcripts) must never live inside a worktree where it
+ * would pollute `get_repo_status` / `get_diff` or leak into commits.
+ * Living under `server.data_dir` (the default) is explicitly allowed; only
+ * repository overlap is rejected. Same realpath-aware comparison as
+ * {@link assertDataDirDisjointFromRepositories}, so symlinks (including
+ * dangling and mid-path links) cannot bypass the check.
+ */
+export function assertAgyAcpStateDirDisjointFromRepositories(
+  stateDir: string,
+  repositories: Record<string, { root: string }>
+): void {
+  for (const [alias, repo] of Object.entries(repositories)) {
+    if (pathsOverlap(stateDir, repo.root)) {
+      throw new CodingAgentError(
+        ErrorCodes.POLICY_DENIED,
+        `Invalid configuration: agents.agy-acp.state_dir '${stateDir}' overlaps repository '${alias}' root '${repo.root}'. state_dir must be outside every configured repository root (living under server.data_dir is allowed).`,
+        { repository: alias, state_dir: stateDir, repository_root: repo.root }
+      );
+    }
+  }
+}
+
+/**
  * Validates that a path does not contain traversal segments or suspicious control characters.
  */
 export function sanitizeRelativePath(relativePath: string): string {
