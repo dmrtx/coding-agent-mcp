@@ -34,6 +34,7 @@ export const DEFAULT_ACP_REQUEST_TIMEOUT_MS = 120_000;
 /** Phase 1 ACP method names (JSON-RPC `method` strings). */
 export const AcpMethods = {
   initialize: "initialize",
+  authenticate: "authenticate",
   sessionNew: "session/new",
   sessionPrompt: "session/prompt",
   sessionCancel: "session/cancel",
@@ -105,5 +106,9 @@ export interface AcpSessionResumeResult {
 
 export interface AcpSetConfigOptionResult {
   updated?: boolean;
+  [key: string]: unknown;
+}
+
+export interface AcpAuthenticateResult {
   [key: string]: unknown;
 }

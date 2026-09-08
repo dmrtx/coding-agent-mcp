@@ -5,6 +5,7 @@ export {
   AcpProtocolError,
   DEFAULT_ACP_MAX_LINE_BYTES,
   DEFAULT_ACP_REQUEST_TIMEOUT_MS,
+  type AcpAuthenticateResult,
   type AcpInitializeResult,
   type AcpMethod,
   type AcpSessionCancelResult,
