@@ -423,6 +423,24 @@ npm run build
 - `t3_cancel_task` interrupts a running turn.
 - No direct Muse/AGY session state is created by any `t3_*` tool.
 
+## Phase 1 Security Decisions and Hardening
+
+The following security hardening rules are enforced across all `t3_*` tools in Phase 1:
+
+1. **Thread IDs are not authorization**:
+   A caller possessing a valid `thread_id` cannot perform operations on that thread unless the underlying T3 project's canonical `workspaceRoot` maps to a repository configured in `coding-agent-mcp`.
+2. **All T3 thread operations are repository-scoped**:
+   Every operation on an existing thread (`t3_continue_task`, `t3_get_task`, `t3_cancel_task`, `t3_respond_approval`, `t3_respond_user_input`, `t3_stop_session`) fetches the thread snapshot, resolves its project in the T3 snapshot, and verifies that the canonical workspace root matches a configured repository in `RepositoryRegistry`. If no match is found, the request fails with `POLICY_DENIED` without leaking unconfigured paths or project names. Even `t3_cancel_task` with an explicit `turn_id` enforces repository authorization.
+3. **Phase 1 T3-backed creation and resume is worktree-only**:
+   - `t3_start_task` rejects `workspace_strategy: in_place` (explicitly or via repository default) with `POLICY_DENIED`. It also enforces repository write policy (`repo.writable === true`), returning `REPOSITORY_NOT_WRITABLE` for read-only repositories.
+   - Operations that resume or advance agent execution (`t3_continue_task`, `t3_respond_approval`, `t3_respond_user_input`) require a worktree-backed thread (`branch !== null || worktreePath !== null`) and a writable repository.
+   - Read-only or terminal operations (`t3_get_task`, `t3_cancel_task`, `t3_stop_session`) remain permitted for configured in-place threads.
+4. **In-place execution parity deferred until lifecycle-aware locking exists**:
+   The legacy direct-agent pipeline provides extensive in-place safety protections (clean-tree validation, policy verification, exclusive in-place lifecycle locking via `WorkspaceManager`). The HTTP-only T3 integration cannot safely acquire, monitor, and release that lifecycle lock across independent HTTP dispatch calls. In-place support for T3-backed tasks is therefore deferred until lifecycle-aware coordination or WebSocket RPC is available in Phase 2.
+5. **Lazy token resolution & exact token redaction**:
+   The T3 bearer token is resolved lazily at request time from the environment variable (`access_token_env`), allowing server construction without requiring credentials up front and enabling zero-downtime token rotation. Error sanitization explicitly replaces the exact resolved token value with `[REDACTED]` prior to running generic token/bearer regexes, preventing credential exposure under arbitrary JSON keys or in network error messages.
+
+
 ## Phase 2 (not this PR)
 
 After Phase 1 smoke tests are green:

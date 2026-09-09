@@ -117,24 +117,23 @@ test("T3Client throws T3ConfigError when enabled=false", () => {
   );
 });
 
-test("T3Client throws T3ConfigError when access token env var is missing", () => {
+test("T3Client does NOT throw at construction when access token env var is missing (lazy resolution)", () => {
   const prev = process.env["T3_TEST_TOKEN"];
   delete process.env["T3_TEST_TOKEN"];
   try {
-    assert.throws(
-      () =>
-        new T3Client({
-          enabled: true,
-          base_url: "http://127.0.0.1:9999",
-          access_token_env: "T3_TEST_TOKEN",
-          request_timeout_ms: 5000,
-        }),
-      T3ConfigError
-    );
+    // Construction must NOT throw — token is resolved lazily at request time (Fix 3)
+    const client = new T3Client({
+      enabled: true,
+      base_url: "http://127.0.0.1:9999",
+      access_token_env: "T3_TEST_TOKEN",
+      request_timeout_ms: 5000,
+    });
+    assert.ok(client instanceof T3Client, "Should return a T3Client without throwing");
   } finally {
     if (prev !== undefined) process.env["T3_TEST_TOKEN"] = prev;
   }
 });
+
 
 test("createT3Client returns null when t3 config is undefined", async () => {
   const { createT3Client } = await import("../../src/t3/t3-client.js");

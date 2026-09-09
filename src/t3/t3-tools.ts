@@ -1,16 +1,37 @@
 /**
  * T3 MCP tools — Phase 1 additive integration.
  *
- * All t3_* tools route through T3Client (HTTP) to the T3 server.
- * They never call Muse/AGY directly, never accept arbitrary paths from callers,
- * and never log or expose bearer tokens.
+ * Security hardening enforced here:
  *
- * Existing direct-agent tools (start_task, continue_task, …) are unmodified.
+ * AUTHORIZATION: Every tool operating on an EXISTING thread verifies that the
+ * T3 project's workspaceRoot maps to a repository configured in this server.
+ * Thread IDs are NOT authorization tokens.
+ *
+ * WRITE POLICY: t3_start_task enforces repo.writable = true and rejects
+ * in_place strategy (Phase 1 requires worktree isolation).
+ *
+ * WORKTREE-ONLY RESUME: t3_continue_task, t3_respond_approval, and
+ * t3_respond_user_input reject in-place threads (they advance agent execution
+ * and require worktree-backed sessions). t3_get_task, t3_cancel_task, and
+ * t3_stop_session are allowed for configured in-place threads.
+ *
+ * TOKEN SAFETY: Token is never logged or surfaced. handleT3ToolError does
+ * not re-expose token-containing data.
+ *
+ * LEGACY TOOLS: Existing direct-agent tools are unmodified.
  */
 
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { T3Client, T3ConfigError, T3HttpError } from "./t3-client.js";
+import {
+  T3Client,
+  T3ConfigError,
+  T3HttpError,
+  T3ModelSelection,
+  T3SnapshotThread,
+  redactGenericTokenPatterns,
+} from "./t3-client.js";
+import { authorizeThread, authorizeProject, isWorktreeThread, T3AuthorizedRepo } from "./t3-auth.js";
 import { RepositoryRegistry } from "../repositories/repository-registry.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 
@@ -31,12 +52,7 @@ function handleT3ToolError(err: unknown) {
         {
           type: "text" as const,
           text: JSON.stringify(
-            {
-              error: {
-                code: "T3_DISABLED_OR_MISCONFIGURED",
-                message: err.message,
-              },
-            },
+            { error: { code: "T3_DISABLED_OR_MISCONFIGURED", message: err.message } },
             null,
             2
           ),
@@ -56,7 +72,7 @@ function handleT3ToolError(err: unknown) {
               error: {
                 code: "T3_HTTP_ERROR",
                 httpStatus: err.status,
-                // safeBody already redacted by T3Client
+                // safeBody is already fully redacted by T3Client
                 detail: err.safeBody,
               },
             },
@@ -71,12 +87,7 @@ function handleT3ToolError(err: unknown) {
   if (err instanceof CodingAgentError) {
     return {
       isError: true,
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(err.toJSON(), null, 2),
-        },
-      ],
+      content: [{ type: "text" as const, text: JSON.stringify(err.toJSON(), null, 2) }],
     };
   }
 
@@ -87,12 +98,7 @@ function handleT3ToolError(err: unknown) {
       {
         type: "text" as const,
         text: JSON.stringify(
-          {
-            error: {
-              code: ErrorCodes.INTERNAL_ERROR,
-              message,
-            },
-          },
+          { error: { code: ErrorCodes.INTERNAL_ERROR, message: redactGenericTokenPatterns(message) } },
           null,
           2
         ),
@@ -102,7 +108,7 @@ function handleT3ToolError(err: unknown) {
 }
 
 /**
- * Require a live T3Client, throwing a T3ConfigError if it's null (disabled).
+ * Require a live T3Client, throwing T3ConfigError if disabled.
  */
 function requireT3Client(client: T3Client | null): T3Client {
   if (!client) {
@@ -112,6 +118,70 @@ function requireT3Client(client: T3Client | null): T3Client {
     );
   }
   return client;
+}
+
+// --------------------------------------------------------------------------
+// Policy helpers
+// --------------------------------------------------------------------------
+
+/**
+ * Asserts that the repository is writable (respects repo.writable policy).
+ */
+function assertRepoWritable(repoAlias: string, repo: { writable: boolean }): void {
+  if (!repo.writable) {
+    throw new CodingAgentError(
+      ErrorCodes.REPOSITORY_NOT_WRITABLE,
+      `Repository '${repoAlias}' is configured as read-only (writable: false). ` +
+        `T3-backed task creation requires a writable repository.`
+    );
+  }
+}
+
+/**
+ * Phase 1 security decision: T3-backed task creation is WORKTREE ONLY.
+ *
+ * The legacy WorkspaceManager in-place path includes allow_in_place policy,
+ * clean-tree validation, and an exclusive in-place lifecycle lock that the
+ * HTTP-only T3 integration cannot safely reproduce/release yet.
+ *
+ * An in_place workspace_strategy (explicit or from repo default) is rejected
+ * unless the caller explicitly requests worktree.
+ */
+function assertWorktreeStrategy(
+  effectiveStrategy: string,
+  callerRequestedStrategy: string | undefined,
+  repoAlias: string
+): void {
+  if (effectiveStrategy === "in_place") {
+    throw new CodingAgentError(
+      ErrorCodes.POLICY_DENIED,
+      callerRequestedStrategy === "in_place"
+        ? `T3 Phase 1 requires worktree isolation for task creation. ` +
+            `The 'in_place' workspace strategy is not permitted via the T3 path in Phase 1 ` +
+            `because the HTTP-only integration cannot safely acquire and release the ` +
+            `WorkspaceManager in-place lifecycle lock. ` +
+            `Use workspace_strategy: worktree instead.`
+        : `Repository '${repoAlias}' defaults to workspace_strategy: in_place, ` +
+            `which is not allowed for T3-backed task creation in Phase 1. ` +
+            `Explicitly pass workspace_strategy: worktree to override.`
+    );
+  }
+}
+
+/**
+ * Asserts a thread is worktree-backed for operations that resume agent execution.
+ * Called for t3_continue_task, t3_respond_approval, t3_respond_user_input.
+ */
+function assertWorktreeThread(thread: T3SnapshotThread): void {
+  if (!isWorktreeThread(thread)) {
+    throw new CodingAgentError(
+      ErrorCodes.POLICY_DENIED,
+      `This T3 thread is running in-place (no worktree branch or path set). ` +
+        `Operations that resume or advance agent execution ` +
+        `(continue, respond to approval/user-input) require a worktree-backed thread ` +
+        `in Phase 1. Use t3_cancel_task or t3_stop_session to terminate the session.`
+    );
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -133,24 +203,47 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_status",
-    "Returns T3 connectivity status, auth info, and orchestration reachability. Does not require a running task.",
+    "Returns T3 connectivity status, auth/scope info, and orchestration reachability. " +
+      "Project and thread counts are filtered to repositories configured in this server. " +
+      "Does not expose unconfigured project paths or the access token.",
     {},
     async () => {
       try {
         const client = requireT3Client(services.t3Client);
         const session = await client.getSession();
 
-        // Lightweight snapshot call to confirm orchestration scope is working
+        const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
+        const grantedScopes: string[] = session.scopes ?? [];
+        const requiredScopesOk = REQUIRED_SCOPES.every((s) => grantedScopes.includes(s));
+
+        // Snapshot call — counts only configured repos/threads
         let snapshotOk = false;
-        let projectCount: number | undefined = undefined;
-        let threadCount: number | undefined = undefined;
+        let configuredProjectCount: number | undefined;
+        let configuredThreadCount: number | undefined;
+
         try {
           const snapshot = await client.getSnapshot();
           snapshotOk = true;
-          projectCount = snapshot.projects.length;
-          threadCount = snapshot.threads.length;
-        } catch {
-          // non-fatal — auth check already passed
+
+          // Filter to T3 projects whose workspaceRoot maps to a configured repo
+          const configuredProjectIds = new Set<string>();
+          for (const project of snapshot.projects) {
+            try {
+              authorizeProject(project, services.repoRegistry);
+              configuredProjectIds.add(project.id);
+            } catch {
+              // Not configured — skip without exposing the path
+            }
+          }
+          configuredProjectCount = configuredProjectIds.size;
+          configuredThreadCount = snapshot.threads.filter((t) =>
+            configuredProjectIds.has(t.projectId)
+          ).length;
+        } catch (snapErr) {
+          if (snapErr instanceof T3ConfigError || snapErr instanceof T3HttpError) {
+            // snapshot not reachable — non-fatal
+          }
+          // Other errors (e.g. snapshotOk remains false) are fine
         }
 
         return {
@@ -160,14 +253,17 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
               text: JSON.stringify(
                 {
                   t3_enabled: true,
+                  base_url: client.getBaseUrl(),
+                  server_reachable: snapshotOk || session.authenticated,
                   authenticated: session.authenticated,
-                  scopes: session.scopes ?? null,
+                  scopes: grantedScopes.length > 0 ? grantedScopes : null,
+                  required_scopes_ok: requiredScopesOk,
                   session_method: session.sessionMethod ?? null,
-                  // expiresAt is an Effect/Schema DateTimeUtc object; convert to string if present
                   expires_at: session.expiresAt ? String(session.expiresAt) : null,
                   orchestration_snapshot_ok: snapshotOk,
-                  project_count: projectCount,
-                  thread_count: threadCount,
+                  // Counts filtered to configured repos only
+                  configured_project_count: configuredProjectCount ?? null,
+                  configured_thread_count: configuredThreadCount ?? null,
                 },
                 null,
                 2
@@ -186,7 +282,8 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_start_task",
-    "Starts a new T3-managed coding-agent task. T3 owns the session, turn, worktree, and state. Returns immediately with the T3 thread id.",
+    "Starts a new T3-managed coding-agent task (worktree-only in Phase 1). " +
+      "T3 owns the session, turn, worktree, and state. Returns immediately with the T3 thread id.",
     {
       repository: z.string().describe("Configured repository alias (from server config)"),
       provider_instance: z
@@ -205,7 +302,10 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
       workspace_strategy: z
         .enum(["worktree", "in_place"])
         .optional()
-        .describe("Workspace strategy (defaults to repository config)"),
+        .describe(
+          "Workspace strategy. Only 'worktree' is permitted in T3 Phase 1. " +
+            "Omit to use repository default (which must also be worktree)."
+        ),
       title: z.string().optional().describe("Optional thread title (auto-derived if omitted)"),
     },
     async (args) => {
@@ -215,7 +315,23 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
         // Resolve repository through RepositoryRegistry — no caller-supplied paths.
         const repo = services.repoRegistry.getRepository(args.repository);
 
-        const strategy = args.workspace_strategy ?? repo.default_workspace_strategy;
+        // FIX 2a: Enforce writable policy
+        assertRepoWritable(args.repository, repo);
+
+        // FIX 2b: Phase 1 — worktree only; reject in_place (explicit or default)
+        const effectiveStrategy = args.workspace_strategy ?? repo.default_workspace_strategy;
+        assertWorktreeStrategy(effectiveStrategy, args.workspace_strategy, args.repository);
+
+        // After assertWorktreeStrategy, effectiveStrategy === "worktree"
+        if (!repo.default_branch) {
+          throw new CodingAgentError(
+            ErrorCodes.POLICY_DENIED,
+            `Worktree workspace strategy requires 'default_branch' to be configured for ` +
+              `repository '${args.repository}'. ` +
+              `Add 'default_branch: <branch>' to the repository config.`
+          );
+        }
+
         const runtimeMode = args.runtime_mode ?? "approval-required";
         const interactionMode = args.interaction_mode ?? "default";
         const title = args.title ?? deriveTitle(args.repository, args.instruction);
@@ -228,41 +344,12 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
         const messageId = crypto.randomUUID();
         const now = new Date().toISOString();
 
-        const modelSelection = {
+        const modelSelection: T3ModelSelection = {
           instanceId: args.provider_instance,
           model: args.model,
         };
 
-        // Build bootstrap — always includes createThread
-        const bootstrap: Record<string, unknown> = {
-          createThread: {
-            projectId,
-            title,
-            modelSelection,
-            runtimeMode,
-            interactionMode,
-            branch: null,
-            worktreePath: null,
-            createdAt: now,
-          },
-        };
-
-        // For worktree strategy, include prepareWorktree
-        if (strategy === "worktree") {
-          if (!repo.default_branch) {
-            throw new CodingAgentError(
-              ErrorCodes.POLICY_DENIED,
-              `Worktree workspace strategy requires 'default_branch' to be configured for repository '${args.repository}'. ` +
-                `Add 'default_branch: <branch>' to the repository config or use 'workspace_strategy: in_place'.`
-            );
-          }
-          bootstrap.prepareWorktree = {
-            projectCwd: repo.root,
-            baseBranch: repo.default_branch,
-            startFromOrigin: true,
-          };
-        }
-
+        // Bootstrap: always createThread + prepareWorktree (worktree-only in Phase 1)
         const command = {
           type: "thread.turn.start",
           commandId,
@@ -276,7 +363,23 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
           modelSelection,
           runtimeMode,
           interactionMode,
-          bootstrap,
+          bootstrap: {
+            createThread: {
+              projectId,
+              title,
+              modelSelection,
+              runtimeMode,
+              interactionMode,
+              branch: null,
+              worktreePath: null,
+              createdAt: now,
+            },
+            prepareWorktree: {
+              projectCwd: repo.root,
+              baseBranch: repo.default_branch,
+              startFromOrigin: true,
+            },
+          },
           createdAt: now,
         };
 
@@ -294,7 +397,7 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
                   title,
                   runtime_mode: runtimeMode,
                   interaction_mode: interactionMode,
-                  workspace_strategy: strategy,
+                  workspace_strategy: "worktree",
                   provider_instance: args.provider_instance,
                   model: args.model,
                   status: "dispatched",
@@ -316,27 +419,53 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_continue_task",
-    "Sends a follow-up instruction to an existing T3-managed thread. Reuses the thread's model/runtime/interaction state unless overridden.",
+    "Sends a follow-up instruction to an existing T3-managed worktree thread. " +
+      "Requires the thread to belong to a configured repository (writable). " +
+      "Reuses thread model/runtime/interaction state (including model options) unless model is overridden.",
     {
       thread_id: z.string().describe("Existing T3 thread id"),
       instruction: z.string().describe("Follow-up instruction for the agent"),
       model: z
         .string()
         .optional()
-        .describe("Override model (keeps same instance id; omit to reuse current model)"),
+        .describe(
+          "Override model (keeps same instance id and clears model-specific options; " +
+            "omit to reuse current model and all model selection options)"
+        ),
     },
     async (args) => {
       try {
         const client = requireT3Client(services.t3Client);
 
-        // Fetch thread to reuse state
-        const snapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit: 1 });
-        const thread = snapshot.thread;
+        // FIX 1: Authorize — fetch thread + find project + map to configured repo
+        const threadSnapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit: 1 });
+        const thread = threadSnapshot.thread;
+        const { authorizedRepo } = await authorizeThread(
+          client,
+          args.thread_id,
+          services.repoRegistry,
+          thread
+        );
 
-        const instanceId = thread.modelSelection.instanceId;
-        const model = args.model ?? thread.modelSelection.model;
-        const runtimeMode = thread.runtimeMode;
-        const interactionMode = thread.interactionMode;
+        // FIX 2: Writable check
+        assertRepoWritable(authorizedRepo.alias, authorizedRepo.config);
+
+        // FIX 2: Phase 1 — reject in-place threads for operations that resume execution
+        assertWorktreeThread(thread);
+
+        // FIX 5: Preserve entire modelSelection (including options) on normal continue
+        let modelSelection: T3ModelSelection;
+        if (args.model !== undefined) {
+          // Explicit override: keep instanceId, use new model, do NOT carry options
+          // (options may be model-specific and could be invalid for a different model)
+          modelSelection = {
+            instanceId: thread.modelSelection.instanceId,
+            model: args.model,
+          };
+        } else {
+          // Preserve the full existing modelSelection including options
+          modelSelection = { ...thread.modelSelection };
+        }
 
         const commandId = crypto.randomUUID();
         const messageId = crypto.randomUUID();
@@ -352,12 +481,9 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
             text: args.instruction,
             attachments: [],
           },
-          modelSelection: {
-            instanceId,
-            model,
-          },
-          runtimeMode,
-          interactionMode,
+          modelSelection,
+          runtimeMode: thread.runtimeMode,
+          interactionMode: thread.interactionMode,
           // No bootstrap on continue
           createdAt: now,
         };
@@ -372,10 +498,11 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
                 {
                   thread_id: args.thread_id,
                   dispatch_sequence: result.sequence,
-                  model_used: model,
-                  instance_id: instanceId,
-                  runtime_mode: runtimeMode,
-                  interaction_mode: interactionMode,
+                  model_used: modelSelection.model,
+                  instance_id: modelSelection.instanceId,
+                  model_options_preserved: args.model === undefined && modelSelection.options !== undefined,
+                  runtime_mode: thread.runtimeMode,
+                  interaction_mode: thread.interactionMode,
                   status: "dispatched",
                 },
                 null,
@@ -395,7 +522,8 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_get_task",
-    "Returns the current state of a T3-managed thread, including model, runtime mode, latest turn, session, recent messages, activities, and checkpoints.",
+    "Returns the current state of a T3-managed thread. Requires the thread to belong to a configured repository. " +
+      "Allowed for both worktree and in-place threads.",
     {
       thread_id: z.string().describe("T3 thread id"),
       turn_limit: z
@@ -410,8 +538,12 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
         const client = requireT3Client(services.t3Client);
         const turnLimit = args.turn_limit ?? 10;
 
+        // Fetch with actual turn limit for display
         const snapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit });
         const thread = snapshot.thread;
+
+        // FIX 1: Authorize (reuse already-fetched thread)
+        await authorizeThread(client, args.thread_id, services.repoRegistry, thread);
 
         // Build a bounded, readable summary
         const result = {
@@ -433,9 +565,8 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
                 updated_at: thread.session.updatedAt,
               }
             : null,
-          // Bound message list to avoid unbounded output
-          recent_messages: (thread.messages as unknown[]).slice(-20),
-          recent_activities: (thread.activities as unknown[]).slice(-50),
+          recent_messages: thread.messages.slice(-20),
+          recent_activities: thread.activities.slice(-50),
           checkpoints: thread.checkpoints,
           snapshot_sequence: snapshot.snapshotSequence,
           page: snapshot.page ?? null,
@@ -443,7 +574,6 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
           updated_at: thread.updatedAt,
         };
 
-        // Bound the JSON output to avoid overwhelming the MCP caller
         const json = JSON.stringify(result, null, 2);
         const bounded =
           json.length > 120_000
@@ -464,7 +594,9 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_cancel_task",
-    "Interrupts a running T3 turn. If turn_id is omitted, fetches the thread to find the active turn id.",
+    "Interrupts a running T3 turn. Requires the thread to belong to a configured repository. " +
+      "Allowed for both worktree and in-place threads. " +
+      "If turn_id is omitted, fetches the thread to find the active turn id.",
     {
       thread_id: z.string().describe("T3 thread id"),
       turn_id: z.string().optional().describe("Turn id to interrupt (auto-resolved if omitted)"),
@@ -474,17 +606,21 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
         const client = requireT3Client(services.t3Client);
 
         let turnId = args.turn_id;
+        let thread: T3SnapshotThread | undefined;
 
-        // Auto-resolve from active session if not supplied
+        // FIX 1: Must always authorize, even when turn_id is explicitly provided.
+        // Fetch the thread first for both authorization and turn_id resolution.
+        const threadSnapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit: 1 });
+        thread = threadSnapshot.thread;
+
+        // Authorize (reuse the fetched thread)
+        await authorizeThread(client, args.thread_id, services.repoRegistry, thread);
+
+        // Resolve turnId from active session if not supplied
         if (!turnId) {
-          try {
-            const snapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit: 1 });
-            const activeTurnId = snapshot.thread.session?.activeTurnId ?? null;
-            if (activeTurnId) {
-              turnId = activeTurnId;
-            }
-          } catch {
-            // Continue without turnId — the command still fires
+          const activeTurnId = thread.session?.activeTurnId ?? null;
+          if (activeTurnId) {
+            turnId = activeTurnId;
           }
         }
 
@@ -528,7 +664,8 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_respond_approval",
-    "Responds to a pending T3 approval request from the coding agent.",
+    "Responds to a pending T3 approval request from the coding agent. " +
+      "Requires the thread to belong to a configured writable worktree repository.",
     {
       thread_id: z.string().describe("T3 thread id"),
       request_id: z.string().describe("Approval request id (from thread activities)"),
@@ -539,6 +676,20 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
     async (args) => {
       try {
         const client = requireT3Client(services.t3Client);
+
+        // FIX 1: Authorize
+        const threadSnapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit: 1 });
+        const thread = threadSnapshot.thread;
+        const { authorizedRepo } = await authorizeThread(
+          client,
+          args.thread_id,
+          services.repoRegistry,
+          thread
+        );
+
+        // FIX 2: Writable + worktree required (resumes execution)
+        assertRepoWritable(authorizedRepo.alias, authorizedRepo.config);
+        assertWorktreeThread(thread);
 
         const result = await client.dispatch({
           type: "thread.approval.respond",
@@ -578,7 +729,8 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_respond_user_input",
-    "Responds to a pending T3 user-input (question/form) request from the coding agent.",
+    "Responds to a pending T3 user-input (question/form) request from the coding agent. " +
+      "Requires the thread to belong to a configured writable worktree repository.",
     {
       thread_id: z.string().describe("T3 thread id"),
       request_id: z.string().describe("User-input request id (from thread activities)"),
@@ -589,6 +741,20 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
     async (args) => {
       try {
         const client = requireT3Client(services.t3Client);
+
+        // FIX 1: Authorize
+        const threadSnapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit: 1 });
+        const thread = threadSnapshot.thread;
+        const { authorizedRepo } = await authorizeThread(
+          client,
+          args.thread_id,
+          services.repoRegistry,
+          thread
+        );
+
+        // FIX 2: Writable + worktree required (resumes execution)
+        assertRepoWritable(authorizedRepo.alias, authorizedRepo.config);
+        assertWorktreeThread(thread);
 
         const result = await client.dispatch({
           type: "thread.user-input.respond",
@@ -627,13 +793,19 @@ export function registerT3Tools(server: McpServer, services: T3ToolServices): vo
   // -----------------------------------------------------------------------
   server.tool(
     "t3_stop_session",
-    "Stops the T3 provider session associated with a thread (graceful session teardown, not a turn interrupt).",
+    "Stops the T3 provider session associated with a thread (graceful session teardown). " +
+      "Requires the thread to belong to a configured repository. Allowed for in-place threads.",
     {
       thread_id: z.string().describe("T3 thread id"),
     },
     async (args) => {
       try {
         const client = requireT3Client(services.t3Client);
+
+        // FIX 1: Authorize (in-place allowed)
+        const threadSnapshot = await client.getThreadSnapshot(args.thread_id, { turnLimit: 1 });
+        const thread = threadSnapshot.thread;
+        await authorizeThread(client, args.thread_id, services.repoRegistry, thread);
 
         const result = await client.dispatch({
           type: "thread.session.stop",

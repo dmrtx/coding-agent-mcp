@@ -60,4 +60,32 @@ export class RepositoryRegistry {
     }
     return list;
   }
+
+  /**
+   * Returns an iterable of [alias, RepositoryConfig] pairs for T3 authorization.
+   * Unlike getRepository(), does NOT validate filesystem existence — used only
+   * for canonical workspaceRoot matching.
+   */
+  public listRepositoriesInternal(): Iterable<[string, RepositoryConfig]> {
+    return this.repositories.entries();
+  }
+
+  /**
+   * Resolves a configured repository by canonical workspace root.
+   * Compares canonical paths using canonicalizePath.
+   * Returns { alias, config } if found, or undefined if no configured repository matches.
+   */
+  public resolveRepositoryByWorkspaceRoot(
+    workspaceRoot: string
+  ): { alias: string; config: RepositoryConfig } | undefined {
+    const canonicalTarget = canonicalizePath(workspaceRoot);
+    for (const [alias, config] of this.repositories.entries()) {
+      const canonicalRepoRoot = canonicalizePath(config.root);
+      if (canonicalTarget === canonicalRepoRoot) {
+        return { alias, config };
+      }
+    }
+    return undefined;
+  }
 }
+

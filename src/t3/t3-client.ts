@@ -3,23 +3,34 @@
  *
  * Security contracts:
  * - Bearer token is NEVER logged, serialized, or included in thrown error messages.
+ * - Token is resolved LAZILY on each request from process.env[access_token_env].
+ *   This means a missing token does NOT prevent client construction or MCP server
+ *   startup — it only fails the individual request.
  * - All request timeouts are enforced via AbortController.
- * - Non-2xx responses are surfaced with HTTP status and a bounded (≤ 2 KB) body excerpt.
- * - Token resolution: process.env[access_token_env] at construction time.
+ * - Non-2xx responses are surfaced with HTTP status and a bounded (≤ 2 KB) body
+ *   excerpt, with the exact token value and generic bearer patterns both redacted.
+ * - Network/fetch error messages are also sanitized before re-throwing.
  */
 
 import { T3Config } from "./t3-config.js";
-import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 
 // --------------------------------------------------------------------------
 // Types matching T3 wire shapes (no runtime lib dependency; plain TS).
+// Kept minimal — only fields we actually consume in Phase 1.
 // --------------------------------------------------------------------------
+
+/** T3 ModelSelection — includes optional per-instance options. */
+export interface T3ModelSelection {
+  instanceId: string;
+  model: string;
+  /** Provider-specific option overrides, preserved on continue. */
+  options?: Record<string, unknown>;
+}
 
 export interface T3SnapshotProject {
   id: string;
   workspaceRoot: string;
   title: string;
-  // additional fields present but not consumed in Phase 1
   [key: string]: unknown;
 }
 
@@ -34,13 +45,28 @@ export interface T3SnapshotThread {
   id: string;
   projectId: string;
   title: string;
-  modelSelection: {
-    instanceId: string;
-    model: string;
-  };
+  modelSelection: T3ModelSelection;
   runtimeMode: string;
   interactionMode: string;
+  branch: string | null;
+  worktreePath: string | null;
+  latestTurn: T3LatestTurn | null;
   session: T3Session | null;
+  messages: unknown[];
+  activities: unknown[];
+  checkpoints: unknown[];
+  createdAt: string;
+  updatedAt: string;
+  [key: string]: unknown;
+}
+
+export interface T3LatestTurn {
+  turnId: string;
+  state: string;
+  requestedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  assistantMessageId: string | null;
   [key: string]: unknown;
 }
 
@@ -68,21 +94,18 @@ export interface T3DispatchResult {
   sequence: number;
 }
 
-// A minimal typed union for the dispatch commands we emit (Phase 1).
-// We use plain records rather than Effect-Schema types — the HTTP server
-// accepts any valid JSON object that matches the union discriminant.
 export type T3DispatchCommand = Record<string, unknown>;
 
 export interface T3AuthSessionState {
   authenticated: boolean;
   scopes?: string[];
   sessionMethod?: string;
-  expiresAt?: string;
+  expiresAt?: unknown;
   auth?: Record<string, unknown>;
 }
 
 // --------------------------------------------------------------------------
-// Error class
+// Error classes
 // --------------------------------------------------------------------------
 
 export class T3HttpError extends Error {
@@ -90,7 +113,7 @@ export class T3HttpError extends Error {
   public readonly safeBody: string;
 
   constructor(status: number, safeBody: string, context: string) {
-    // Never include bearer token in message
+    // safeBody is already redacted before this constructor is called.
     super(`T3 HTTP ${status} on ${context}: ${safeBody}`);
     this.name = "T3HttpError";
     this.status = status;
@@ -115,39 +138,60 @@ const SAFE_BODY_LIMIT = 2048;
 
 export class T3Client {
   private readonly baseUrl: string;
-  private readonly token: string;
+  private readonly tokenEnvVar: string;
   private readonly timeoutMs: number;
 
+  /**
+   * Constructs a T3Client.
+   *
+   * Token resolution is LAZY — we do NOT read process.env here.
+   * This means a missing/expired token does not prevent MCP server startup;
+   * the error surfaces only when a request is made.
+   */
   constructor(config: T3Config) {
     if (!config.enabled) {
       throw new T3ConfigError("T3 integration is disabled (t3.enabled is false)");
     }
     // Strip trailing slash from base_url
     this.baseUrl = config.base_url.replace(/\/+$/, "");
-
-    const tokenValue = process.env[config.access_token_env];
-    if (!tokenValue || tokenValue.trim() === "") {
-      throw new T3ConfigError(
-        `T3 access token is missing. ` +
-          `Set the environment variable named in t3.access_token_env (currently: ${config.access_token_env}). ` +
-          `The token value must never be placed in config files.`
-      );
-    }
-    this.token = tokenValue;
+    // Store the env var name, NOT the value
+    this.tokenEnvVar = config.access_token_env;
     this.timeoutMs = config.request_timeout_ms;
   }
 
-  /** Builds an Authorization header without exposing the raw token in any object key names */
-  private authHeader(): Record<string, string> {
-    return { Authorization: `Bearer ${this.token}` };
+  /** Returns the normalized base URL (without trailing slash). */
+  public getBaseUrl(): string {
+    return this.baseUrl;
   }
 
-  /** Performs an HTTP request with timeout enforcement. Never logs the token. */
+  /**
+   * Resolves the bearer token from process.env at request time.
+   * Throws T3ConfigError (never exposes the value) if missing.
+   */
+  private resolveToken(): string {
+    const tokenValue = process.env[this.tokenEnvVar];
+    if (!tokenValue || tokenValue.trim() === "") {
+      throw new T3ConfigError(
+        `T3 access token is missing. ` +
+          `Set the environment variable '${this.tokenEnvVar}' before making T3 requests. ` +
+          `The token value must never be placed in config files.`
+      );
+    }
+    return tokenValue;
+  }
+
+  /**
+   * Performs an HTTP request with timeout enforcement and token redaction.
+   * The resolved token is NEVER logged or included in any thrown error.
+   */
   private async request<T>(
     method: "GET" | "POST",
     path: string,
     options: { body?: unknown; query?: Record<string, string | number | undefined> } = {}
   ): Promise<T> {
+    // Resolve token lazily — throws T3ConfigError if missing
+    const token = this.resolveToken();
+
     const controller = new AbortController();
     const timerId = setTimeout(() => controller.abort(), this.timeoutMs);
 
@@ -162,7 +206,7 @@ export class T3Client {
     }
 
     const headers: Record<string, string> = {
-      ...this.authHeader(),
+      Authorization: `Bearer ${token}`,
       Accept: "application/json",
     };
     if (method === "POST" && options.body !== undefined) {
@@ -182,7 +226,12 @@ export class T3Client {
       if (err instanceof Error && err.name === "AbortError") {
         throw new T3HttpError(0, "Request timed out", path);
       }
-      throw err;
+      // Sanitize network error messages — they may echo the URL which could
+      // theoretically contain credential material (though we never put it there).
+      const safeMsg = err instanceof Error
+        ? redactExact(token, redactGenericTokenPatterns(err.message)).slice(0, SAFE_BODY_LIMIT)
+        : "Network error";
+      throw new T3HttpError(0, safeMsg, path);
     } finally {
       clearTimeout(timerId);
     }
@@ -194,17 +243,18 @@ export class T3Client {
       } catch {
         // swallow read errors
       }
-      // Redact anything that looks like a bearer token before surfacing
-      const safeBody = redactTokens(rawBody).slice(0, SAFE_BODY_LIMIT);
+      // Step 1: redact exact token value (works regardless of JSON key name or Bearer prefix)
+      // Step 2: redact generic bearer/token patterns as defence-in-depth
+      const safeBody = redactGenericTokenPatterns(redactExact(token, rawBody)).slice(0, SAFE_BODY_LIMIT);
       throw new T3HttpError(response.status, safeBody, path);
     }
 
     return response.json() as Promise<T>;
   }
 
-  // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // Public API methods
-  // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
 
   /** GET /api/auth/session — connection/auth status check. */
   async getSession(): Promise<T3AuthSessionState> {
@@ -277,24 +327,37 @@ export class T3Client {
 // --------------------------------------------------------------------------
 
 /** Normalize path for workspace-root comparison (trailing slash insensitive). */
-function normalizeRoot(p: string): string {
+export function normalizeRoot(p: string): string {
   return p.replace(/\/+$/, "");
 }
 
 /**
- * Redact strings that look like bearer tokens (long base64url strings).
- * This is a defensive measure; tokens should never reach error bodies, but
- * if a 4xx body echoes the auth header we won't surface the raw value.
+ * Redact the exact resolved token value from any string.
+ * This catches cases where the server echoes the token under an arbitrary JSON
+ * key name (not "token", not prefixed by "Bearer ").
+ *
+ * The token string itself MUST NOT appear in any log or error surface.
  */
-function redactTokens(text: string): string {
-  // Replace long (>= 20 chars) base64url-like tokens after "Bearer " prefix
+export function redactExact(token: string, text: string): string {
+  if (!token || token.length < 8) return text; // safety: don't redact trivial strings
+  // Escape regex special chars in the token before using it as a pattern
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return text.replace(new RegExp(escaped, "g"), "[REDACTED]");
+}
+
+/**
+ * Defence-in-depth: redact strings that look like bearer tokens or common
+ * token JSON fields, AFTER exact-value redaction has already run.
+ */
+export function redactGenericTokenPatterns(text: string): string {
   return text
     .replace(/Bearer\s+[A-Za-z0-9\-_+/=]{20,}/g, "Bearer [REDACTED]")
-    .replace(/"(access_token|token|bearer)"\s*:\s*"[A-Za-z0-9\-_+/=.]{20,}"/gi, '"$1":"[REDACTED]"');
+    .replace(/"(access_token|token|bearer|authorization)"\s*:\s*"[A-Za-z0-9\-_+/=.]{20,}"/gi, '"$1":"[REDACTED]"');
 }
 
 // --------------------------------------------------------------------------
 // Factory — creates a T3Client from config, returning null when disabled.
+// Does NOT resolve the token — construction is always safe.
 // --------------------------------------------------------------------------
 
 export function createT3Client(t3Config: T3Config | undefined): T3Client | null {
