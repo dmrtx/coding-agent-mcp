@@ -45,7 +45,31 @@ export interface AcpPermissionDecision {
     outsideWorkspace: string[];
     allowWriteWorktree: boolean;
     workspaceRoot: string;
+    /** Adapter-supplied agent-internal scratch root, when one was in effect. */
+    internalScratchRoot?: string;
   };
+}
+
+/**
+ * Derive the adapter-owned agent-internal scratch root for one ACP session.
+ *
+ * Shape: `<geminiHome>/antigravity-acp/brain/<sessionId>/scratch`, where
+ * `geminiHome` is the isolated persistent `GEMINI_HOME` and `sessionId` is
+ * the exact established ACP session id. Returns `undefined` fail-closed for
+ * any missing, relative, or unsafe input. The session id allowlist rejects
+ * path separators and traversal so sibling/parent roots are unreachable.
+ */
+export function resolveAcpSessionScratchRoot(
+  geminiHome: unknown,
+  sessionId: unknown
+): string | undefined {
+  if (typeof geminiHome !== "string" || geminiHome.length === 0) return undefined;
+  if (!path.isAbsolute(geminiHome)) return undefined;
+  if (typeof sessionId !== "string") return undefined;
+  const sid = sessionId.trim();
+  if (sid.length === 0 || sid.length > 128) return undefined;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sid)) return undefined;
+  return path.join(geminiHome, "antigravity-acp", "brain", sid, "scratch");
 }
 
 const READ_TOOLS = new Set([
@@ -121,6 +145,9 @@ function isPathField(key: string): boolean {
  * any depth, and detects nested command/url payloads. Cycle-safe and
  * depth-capped; anything beyond the cap counts as opaque. Nested plain
  * strings under unknown names (e.g. CLI flags) are NOT treated as paths.
+ * The official-kernel `rawInput` query envelope is normalized, not opaque:
+ * scalar-only metadata is inert, while path/command/url keys and nested
+ * structures inside it keep their usual signal treatment.
  */
 function extractSignals(toolCall: AcpToolCallShape): ExtractedSignals {
   const paths: string[] = [];
@@ -174,11 +201,53 @@ function extractSignals(toolCall: AcpToolCallShape): ExtractedSignals {
       visit(value, 1);
     }
   }
+  /**
+   * Official-kernel query envelope (`rawInput`): scalar-only search
+   * metadata such as `{ query }` is NOT opaque — it carries no filesystem
+   * or network addressing. Path-field keys still collect auditable paths
+   * (so outside-workspace containment keeps rejecting), command/url keys
+   * still flag executable payloads, and any nested object/array still
+   * marks the payload opaque (visited as usual so deeper path/command
+   * signals are not lost). A non-plain-object `rawInput` keeps the
+   * generic opaque treatment below.
+   */
+  const visitQueryEnvelope = (envelope: Record<string, unknown>): void => {
+    for (const [key, entry] of Object.entries(envelope)) {
+      if (typeof entry === "string") {
+        if (entry.length === 0) continue;
+        if (isPathField(key)) paths.push(entry);
+        else if (key === "command" || key === "url") nestedCommandOrUrl = true;
+        // Any other scalar string is inert query metadata: ignored.
+        continue;
+      }
+      if (typeof entry === "object" && entry !== null) {
+        if (isPathField(key) && Array.isArray(entry)) {
+          for (const item of entry) {
+            if (typeof item === "string") {
+              if (item.length > 0) paths.push(item);
+            } else if (typeof item === "object" && item !== null) {
+              opaqueNestedPayload = true;
+              visit(item, 1);
+            }
+          }
+          continue;
+        }
+        opaqueNestedPayload = true;
+        visit(entry, 1);
+        continue;
+      }
+      // Numbers, booleans, null/undefined: inert query metadata.
+    }
+  };
   // Nested scan of every other top-level object/array value (top-level
   // command/url stay the caller's own check, not "nested").
   for (const [key, entry] of Object.entries(record)) {
     if (isPathField(key) || key === "command" || key === "url") continue;
     if (typeof entry === "object" && entry !== null) {
+      if (key === "rawInput" && !Array.isArray(entry)) {
+        visitQueryEnvelope(entry as Record<string, unknown>);
+        continue;
+      }
       opaqueNestedPayload = true;
       visit(entry, 1);
     }
@@ -199,14 +268,28 @@ function isContained(candidate: string, workspaceRoot: string): boolean {
  * Pure ACP permission-policy helper (phase 1 foundation, no I/O).
  *
  * Fail-closed rules:
- * - Everything outside `workspaceRoot` is denied, for every kind and mode.
+ * - Everything outside `workspaceRoot` is denied, for every kind and mode,
+ *   EXCEPT the narrow agent-internal scratch exception below (which never
+ *   touches the repository).
  * - `read`/`search`/`think` are auto-allowed only when every referenced path
  *   (top-level or nested) is inside the workspace. `think` additionally
  *   requires no command/url payload at any depth and no nested structure
  *   at all. Nested command/url payloads deny every kind.
- * - `review`/`investigate` deny all writes, execute, delete, move, fetch,
- *   and anything unrecognized — even when contained and gated.
- * - `implement` additionally allows `edit`/`write` only when
+ * - Pathless native `search` (no paths at any depth, including inside a
+ *   query-only `rawInput` envelope) is treated as workspace-scoped and
+ *   allowed in every mode ONLY when the kind is `search`, there is no
+ *   command/url payload at any depth, and there is no opaque nested
+ *   structure. Pathless `read` stays denied.
+ * - Agent-internal scratch: `edit`/`write`/`create` (kind `edit`) whose
+ *   every path is contained in the adapter-supplied `internalScratchRoot`
+ *   (`<geminiHome>/antigravity-acp/brain/<sessionId>/scratch`) is allowed in
+ *   every task mode without the `allowWriteWorktree` gate, because it does
+ *   not touch the repository. `delete`/`move`/`execute`/`fetch`/`other`
+ *   inside the scratch root stay denied; traversal/outside-scratch and
+ *   command/url payloads deny; normal repository writes stay gated.
+ * - `review`/`investigate` deny all repository writes, execute, delete,
+ *   move, fetch, and anything unrecognized — even when contained and gated.
+ * - `implement` additionally allows repository `edit`/`write` only when
  *   `allowWriteWorktree` is true AND every path is contained. Execute,
  *   delete, move, fetch, and unrecognized tools stay denied.
  * - There is deliberately NO yolo bypass: the ACP agent `mode` is not even
@@ -217,8 +300,13 @@ export function decideAcpToolPermission(input: {
   mode: AcpTaskMode;
   allowWriteWorktree: boolean;
   toolCall: AcpToolCallShape;
+  /** Agent-internal scratch root supplied by the adapter; absent = no exception. */
+  internalScratchRoot?: string;
 }): AcpPermissionDecision {
   const { workspaceRoot, mode, allowWriteWorktree, toolCall } = input;
+  const scratchRaw = typeof input.internalScratchRoot === "string" ? input.internalScratchRoot : "";
+  const internalScratchRoot =
+    scratchRaw.length > 0 && path.isAbsolute(scratchRaw) ? scratchRaw : undefined;
   const rawTool = typeof toolCall.tool === "string" ? toolCall.tool : toolCall.kind;
   const tool = normalizeToolName(rawTool) || "unknown";
   const kind = categorizeTool(tool);
@@ -230,6 +318,27 @@ export function decideAcpToolPermission(input: {
     (typeof toolCall.url === "string" && toolCall.url.length > 0) ||
     signals.nestedCommandOrUrl;
 
+  const isInsideScratch = (candidate: string): boolean => {
+    if (internalScratchRoot === undefined) return false;
+    try {
+      const absolute = path.isAbsolute(candidate)
+        ? candidate
+        : path.resolve(workspaceRoot, candidate);
+      return isPathSameOrInside(absolute, internalScratchRoot);
+    } catch {
+      return false;
+    }
+  };
+  const allInsideScratch =
+    internalScratchRoot !== undefined &&
+    paths.length > 0 &&
+    paths.every(isInsideScratch);
+  // Scratch paths live outside the repository by construction (state_dir is
+  // disjoint from every repository root). Require that here so an
+  // overlapping root can never turn a repository write into an ungated
+  // scratch write: every path must be outside the workspace.
+  const allOutsideWorkspace = paths.length > 0 && outsideWorkspace.length === paths.length;
+
   const base = {
     mode,
     tool,
@@ -238,6 +347,7 @@ export function decideAcpToolPermission(input: {
     outsideWorkspace,
     allowWriteWorktree,
     workspaceRoot,
+    ...(internalScratchRoot !== undefined ? { internalScratchRoot } : {}),
   };
 
   const deny = (reason: string): AcpPermissionDecision => ({ allowed: false, reason, details: base });
@@ -247,6 +357,18 @@ export function decideAcpToolPermission(input: {
   // passed where a task mode belongs), even if TypeScript is bypassed.
   if (mode !== "implement" && mode !== "review" && mode !== "investigate") {
     return deny(`Denied '${tool}' (${kind}): unknown task mode '${String(mode)}'`);
+  }
+
+  // Narrow agent-internal scratch exception: edit/write/create only, every
+  // path contained in the exact session scratch root, no command/url at any
+  // depth. Allowed in every task mode without the worktree gate because it
+  // cannot touch the repository. Delete/move/execute/fetch/other inside the
+  // scratch root fall through to the normal denies below.
+  if (kind === "edit" && allInsideScratch && allOutsideWorkspace) {
+    if (hasExecutablePayload) {
+      return deny(`Denied '${tool}' (edit) in ${mode} mode: scratch writes must not carry command/url payloads`);
+    }
+    return allow(`Allowed '${tool}' (edit) in ${mode} mode: all ${paths.length} path(s) inside agent-internal scratch`);
   }
 
   if (outsideWorkspace.length > 0) {
@@ -269,6 +391,13 @@ export function decideAcpToolPermission(input: {
       return deny(`Denied '${tool}' (${kind}) in ${mode} mode: read-only operations must not carry command/url payloads`);
     }
     if (paths.length === 0) {
+      // Official kernels issue native search without auditable paths. Treat
+      // that narrow shape as workspace-scoped search: search kind only, no
+      // executable payload, and no opaque nested structure that could hide
+      // side effects. Pathless read stays denied.
+      if (kind === "search" && !signals.opaqueNestedPayload) {
+        return allow(`Allowed '${tool}' (search) in ${mode} mode: workspace-scoped native search with no paths`);
+      }
       return deny(`Denied '${tool}' (${kind}) in ${mode} mode: no auditable in-workspace paths provided`);
     }
     return allow(`Allowed '${tool}' (${kind}) in ${mode} mode: all ${paths.length} path(s) inside workspace`);
