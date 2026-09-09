@@ -86,7 +86,13 @@ export interface AcpTurnOptions {
   baseEnv?: Record<string, string>;
   /** Full explicit env for the kernel (takes precedence over taskId env). */
   env?: Record<string, string>;
-  /** Optional model hint forwarded to `session/new`. */
+  /**
+   * Optional model override. When set (or when `agents.agy-acp.model` is
+   * set), it is applied AFTER `session/new`/`session/resume` via
+   * `session/set_config_option` against the kernel-advertised `model`
+   * selector (exact value match, fail-closed). It is never sent ad-hoc
+   * inside `session/new` params.
+   */
   model?: string;
   /**
    * Existing session id to resume via `session/resume` instead of creating
@@ -218,6 +224,66 @@ export function isAcpAuthRequiredError(err: unknown): boolean {
   }
   const hay = parts.join("\n").toLowerCase();
   return hay.includes("authenticat") || hay.includes("auth.type") || hay.includes("auth required");
+}
+
+/**
+ * Extract advertised string values from a `configOptions` selector entry.
+ *
+ * Tolerates the shapes kernels use in practice: the value list may live
+ * under `options`, `values`, `availableValues`, `allowedValues`,
+ * `choices`, or `items`, and each entry may be a plain string or an
+ * object carrying the value under `value` (preferred) or `id`.
+ */
+function extractAdvertisedOptionValues(selector: Record<string, unknown>): string[] {
+  const lists = [
+    selector.options,
+    selector.values,
+    selector.availableValues,
+    selector.allowedValues,
+    selector.choices,
+    selector.items,
+  ];
+  const out: string[] = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const entry of list) {
+      if (typeof entry === "string") {
+        if (entry.length > 0 && !out.includes(entry)) out.push(entry);
+      } else if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+        const record = entry as Record<string, unknown>;
+        const value = record.value;
+        if (typeof value === "string" && value.length > 0) {
+          if (!out.includes(value)) out.push(value);
+        } else if (typeof record.id === "string" && record.id.length > 0) {
+          if (!out.includes(record.id)) out.push(record.id);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Find the model selector inside a `session/new` (or `session/resume`)
+ * result's advertised `configOptions`.
+ *
+ * Matches by `id === "model"` OR `category === "model"` and returns the
+ * actual selector id to use as `configId` plus its advertised values.
+ * Returns `undefined` when `configOptions` is not an array or holds no
+ * model selector.
+ */
+function findModelConfigSelector(configOptions: unknown): { configId: string; values: string[] } | undefined {
+  if (!Array.isArray(configOptions)) return undefined;
+  for (const entry of configOptions) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const selector = entry as Record<string, unknown>;
+    const id = selector.id;
+    const category = selector.category;
+    if (id !== "model" && category !== "model") continue;
+    if (typeof id !== "string" || id.length === 0) continue;
+    return { configId: id, values: extractAdvertisedOptionValues(selector) };
+  }
+  return undefined;
 }
 
 /**
@@ -466,6 +532,17 @@ export class AgyAcpAdapter implements CodingAgent {
    * finishes on any answer. Slice 2 adds TaskManager lifecycle and
    * transcript plumbing. This helper is NOT called by TaskManager yet.
    *
+   * When a model is configured (`options.model` or
+   * `agents.agy-acp.model`), it is applied after `session/new` (or
+   * `session/resume`) via `session/set_config_option` against the
+   * session's advertised `configOptions` model selector (`id` or
+   * `category` equal to `"model"`): the configured value must exactly
+   * match one advertised option value or the turn fails closed with
+   * `INTERNAL_ERROR` before `session/prompt`. Unset models send no
+   * `set_config_option`; `session/new` never carries an ad-hoc `model`.
+   * `session/prompt` uses the turn's remaining `timeoutMs`, not the
+   * generic client default, while `session/cancel` stays usable.
+   *
    * A missing binary fails with typed `AGENT_NOT_AVAILABLE` and NEVER
    * falls back to the legacy `agy` binary.
    */
@@ -517,7 +594,9 @@ export class AgyAcpAdapter implements CodingAgent {
     const cwd = options.cwd ?? process.cwd();
     const timeoutMs =
       options.timeoutMs ?? (this.config.default_timeout_seconds ?? 1800) * 1000;
-    const model = options.model ?? this.config.model;
+    const configuredModelRaw = options.model ?? this.config.model;
+    const configuredModel =
+      typeof configuredModelRaw === "string" ? configuredModelRaw.trim() : "";
     const permissionContext: AcpPermissionContext = {
       workspaceRoot: options.workspaceRoot,
       mode: options.mode,
@@ -603,6 +682,10 @@ export class AgyAcpAdapter implements CodingAgent {
 
     return await new Promise<AcpTurnResult>((resolve, reject) => {
       let settled = false;
+      // Turn start for the safely bounded `session/prompt` request timeout
+      // below (remaining overall time, floored so a slow handshake cannot
+      // produce a degenerate zero timeout).
+      const turnStartMs = Date.now();
       const client = new AcpClient({
         sendLine: (line) => {
           if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) {
@@ -759,6 +842,7 @@ export class AgyAcpAdapter implements CodingAgent {
           const authenticateOnce = (): Promise<unknown> =>
             client.authenticate({ methodId: authMethodId });
           let sessionId: string;
+          let sessionConfigOptions: unknown;
           if (resumeSessionId !== undefined) {
             // Continue path: resume the existing session. `session/new`
             // must NOT be called here — including on the auth retry path.
@@ -790,12 +874,12 @@ export class AgyAcpAdapter implements CodingAgent {
               );
             }
             sessionId = resumeSessionId;
+            sessionConfigOptions = resumed.configOptions;
           } else {
             const newOnce = (): Promise<Record<string, unknown>> =>
               client.sessionNew({
                 cwd,
                 mcpServers: [],
-                ...(model ? { model } : {}),
               }) as unknown as Promise<Record<string, unknown>>;
             let created: Record<string, unknown>;
             try {
@@ -817,12 +901,52 @@ export class AgyAcpAdapter implements CodingAgent {
               );
             }
             sessionId = rawSessionId.trim();
+            sessionConfigOptions = created.configOptions;
           }
           if (activeTurn) activeTurn.sessionId = sessionId;
-          const answer = (await client.sessionPrompt({
-            sessionId,
-            prompt: [{ type: "text", text: prompt }],
-          })) as Record<string, unknown>;
+          if (configuredModel.length > 0) {
+            const selector = findModelConfigSelector(sessionConfigOptions);
+            if (!selector) {
+              throw new CodingAgentError(
+                ErrorCodes.INTERNAL_ERROR,
+                `Configured agy-acp model '${configuredModel}' is not advertised by the kernel (no 'model' config option in session result); refusing to fall back to kernel default`,
+                { agent: this.id, sessionId, configuredModel }
+              );
+            }
+            if (!selector.values.includes(configuredModel)) {
+              throw new CodingAgentError(
+                ErrorCodes.INTERNAL_ERROR,
+                `Configured agy-acp model '${configuredModel}' is not among the kernel-advertised model options (${selector.values.length > 0 ? selector.values.map((v) => `'${v}'`).join(", ") : "none"}); refusing to fall back to kernel default`,
+                {
+                  agent: this.id,
+                  sessionId,
+                  configuredModel,
+                  configId: selector.configId,
+                  advertisedModels: selector.values,
+                }
+              );
+            }
+            await client.sessionSetConfigOption({
+              sessionId,
+              configId: selector.configId,
+              value: configuredModel,
+            });
+          }
+          // `session/prompt` is the long pole of a coding turn: it must be
+          // bounded by the managed turn's `timeoutMs` (remaining overall
+          // time here), not the generic ~120s client default used for
+          // `initialize`/`session/new`/`authenticate`. The prompt runs on
+          // the shared client with its own timer, so `session/cancel`
+          // remains independently usable while it is pending.
+          const elapsedMs = Date.now() - turnStartMs;
+          const promptTimeoutMs = Math.max(1000, timeoutMs - elapsedMs);
+          const answer = (await client.sessionPrompt(
+            {
+              sessionId,
+              prompt: [{ type: "text", text: prompt }],
+            },
+            { timeoutMs: promptTimeoutMs }
+          )) as Record<string, unknown>;
           const rawStopReason = answer.stopReason;
           const stopReason =
             typeof rawStopReason === "string" && rawStopReason.trim().length > 0

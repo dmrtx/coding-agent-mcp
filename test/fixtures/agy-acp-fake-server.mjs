@@ -13,6 +13,16 @@ import process from "node:process";
 
 let sessionCounter = 0;
 let permissionCounter = 9000;
+// Minimal advertised model selector for configured-model tests. Matched by
+// the adapter via `id === "model"` (also `category === "model"`); values
+// are matched exactly, fail-closed.
+const FAKE_MODEL_CONFIG_OPTIONS = [
+  {
+    id: "model",
+    category: "model",
+    options: [{ value: "test-model" }, { value: "fake-model-b" }],
+  },
+];
 const sessions = new Map(); // sessionId -> { sessionId, cwd, model, options }
 const pendingPrompts = new Map(); // permissionRequestId -> { origId, sessionId }
 // Cancel-test markers (phase 2A cancel slice, test-only):
@@ -148,7 +158,7 @@ function handleRequest(msg) {
         options: {},
       });
       persistSessions();
-      send({ jsonrpc: "2.0", id, result: { sessionId } });
+      send({ jsonrpc: "2.0", id, result: { sessionId, configOptions: FAKE_MODEL_CONFIG_OPTIONS } });
       return;
     }
 
@@ -278,13 +288,17 @@ function handleRequest(msg) {
         errorTo(id, -32002, `Unknown session: ${String(sessionId)}`);
         return;
       }
-      send({ jsonrpc: "2.0", id, result: { sessionId, resumed: true } });
+      send({ jsonrpc: "2.0", id, result: { sessionId, resumed: true, configOptions: FAKE_MODEL_CONFIG_OPTIONS } });
       return;
     }
 
     case "session/set_config_option": {
-      if (typeof p.key !== "string" || p.key.length === 0) {
-        errorTo(id, -32602, "Invalid params: 'key' is required");
+      // Adapter contract uses `{ sessionId, configId, value }`; legacy
+      // protocol-level tests use `{ sessionId, key, value }`. Accept either
+      // identifier minimally and record under the resolved key.
+      const rawKey = typeof p.configId === "string" && p.configId.length > 0 ? p.configId : p.key;
+      if (typeof rawKey !== "string" || rawKey.length === 0) {
+        errorTo(id, -32602, "Invalid params: 'key' is required ('configId' accepted as alias)");
         return;
       }
       const sessionId = typeof p.sessionId === "string" ? p.sessionId : null;
@@ -293,12 +307,13 @@ function handleRequest(msg) {
           errorTo(id, -32002, `Unknown session: ${sessionId}`);
           return;
         }
-        sessions.get(sessionId).options[p.key] = p.value ?? null;
+        sessions.get(sessionId).options[rawKey] = p.value ?? null;
+        persistSessions();
       }
       send({
         jsonrpc: "2.0",
         id,
-        result: { updated: true, key: p.key, value: p.value ?? null, sessionId },
+        result: { updated: true, key: rawKey, configId: rawKey, value: p.value ?? null, sessionId },
       });
       return;
     }
