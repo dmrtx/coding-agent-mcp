@@ -20,6 +20,7 @@ import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 import { AcpClient } from "./acp/client.js";
 import {
   decideAcpToolPermission,
+  resolveAcpSessionScratchRoot,
   type AcpTaskMode,
   type AcpToolCallShape,
 } from "./acp/permission-policy.js";
@@ -120,6 +121,16 @@ export interface AcpPermissionContext {
   workspaceRoot?: unknown;
   mode?: unknown;
   allowWriteWorktree?: boolean;
+  /**
+   * Agent-internal scratch root for the current ACP session/profile
+   * (`<geminiHome>/antigravity-acp/brain/<sessionId>/scratch`). Supplied by
+   * the adapter from the isolated persistent `GEMINI_HOME` and the exact
+   * established session id; never sourced from agent input. When present,
+   * the permission policy allows `edit`/`write`/`create` only inside this
+   * root in every task mode without the worktree gate. All other kinds stay
+   * denied there.
+   */
+  internalScratchRoot?: unknown;
 }
 
 export interface AcpPermissionAnswer {
@@ -470,8 +481,11 @@ export class AgyAcpAdapter implements CodingAgent {
    * phase-1 `decideAcpToolPermission` policy. Fail-closed: a missing or
    * unrecognized `mode`, a missing `workspaceRoot`, or an unauditable
    * (missing/unshaped) tool call is denied without consulting anything
-   * else. `review`/`investigate` deny all writes; `implement` writes
-   * require the explicit `allowWriteWorktree` gate plus containment.
+   * else. `review`/`investigate` deny all repository writes; `implement`
+   * repository writes require the explicit `allowWriteWorktree` gate plus
+   * containment. The adapter-supplied `internalScratchRoot` (when present)
+   * allows agent-internal `edit`/`write`/`create` only inside that root in
+   * every mode; every other kind stays denied there.
    */
   public decidePermissionRequest(
     params: unknown,
@@ -498,11 +512,15 @@ export class AgyAcpAdapter implements CodingAgent {
         reason: "Denied permission request: no auditable tool call payload (fail-closed)",
       };
     }
+    const scratchRaw = context.internalScratchRoot;
+    const internalScratchRoot =
+      typeof scratchRaw === "string" && scratchRaw.length > 0 ? scratchRaw : undefined;
     const verdict = decideAcpToolPermission({
       workspaceRoot,
       mode,
       allowWriteWorktree: context.allowWriteWorktree ?? this.config.allow_write_worktree ?? false,
       toolCall,
+      ...(internalScratchRoot !== undefined ? { internalScratchRoot } : {}),
     });
     return { decision: verdict.allowed ? "allow" : "deny", reason: verdict.reason };
   }
@@ -527,10 +545,14 @@ export class AgyAcpAdapter implements CodingAgent {
    * Inbound `session/request_permission` probes (as emitted by the fake
    * kernel fixture) are answered with the real phase-1
    * `decideAcpToolPermission` policy parameterized by `workspaceRoot`,
-   * `mode`, and `allowWriteWorktree`. Missing mode/policy context denies
-   * (fail-closed); the turn itself still completes because the fake kernel
-   * finishes on any answer. Slice 2 adds TaskManager lifecycle and
-   * transcript plumbing. This helper is NOT called by TaskManager yet.
+   * `mode`, `allowWriteWorktree`, and the turn-bound agent-internal scratch
+   * root (`<GEMINI_HOME>/antigravity-acp/brain/<sessionId>/scratch`,
+   * derived after session/new|resume from the isolated persistent
+   * `GEMINI_HOME` and the exact established session id). Missing
+   * mode/policy context denies (fail-closed); the turn itself still
+   * completes because the fake kernel finishes on any answer. Slice 2 adds
+   * TaskManager lifecycle and transcript plumbing. This helper is NOT
+   * called by TaskManager yet.
    *
    * When a model is configured (`options.model` or
    * `agents.agy-acp.model`), it is applied after `session/new` (or
@@ -604,12 +626,23 @@ export class AgyAcpAdapter implements CodingAgent {
     };
 
     let spawnEnv: Record<string, string>;
+    let isolatedGeminiHome: string | undefined;
     if (options.env) {
       spawnEnv = stripCredentialEnv(options.env);
+      const candidate = spawnEnv.GEMINI_HOME;
+      if (typeof candidate === "string" && candidate.length > 0 && path.isAbsolute(candidate)) {
+        isolatedGeminiHome = candidate;
+      }
     } else if (options.taskId) {
-      spawnEnv = this.buildIsolatedEnv(options.taskId, options.baseEnv ?? {}).env;
+      const isolated = this.buildIsolatedEnv(options.taskId, options.baseEnv ?? {});
+      spawnEnv = isolated.env;
+      isolatedGeminiHome = isolated.geminiHome;
     } else {
       spawnEnv = stripCredentialEnv(options.baseEnv ?? {});
+      const candidate = spawnEnv.GEMINI_HOME;
+      if (typeof candidate === "string" && candidate.length > 0 && path.isAbsolute(candidate)) {
+        isolatedGeminiHome = candidate;
+      }
     }
     // The spawned kernel always uses file credential storage; host values
     // via env/baseEnv cannot override it.
@@ -904,6 +937,16 @@ export class AgyAcpAdapter implements CodingAgent {
             sessionConfigOptions = created.configOptions;
           }
           if (activeTurn) activeTurn.sessionId = sessionId;
+          // Bind the agent-internal scratch root to the exact established
+          // session id (never to an inbound claimed id): permission probes
+          // during session/prompt below then allow scratch edits only under
+          // `<geminiHome>/antigravity-acp/brain/<sessionId>/scratch`.
+          if (isolatedGeminiHome !== undefined) {
+            const scratch = resolveAcpSessionScratchRoot(isolatedGeminiHome, sessionId);
+            if (scratch !== undefined) {
+              permissionContext.internalScratchRoot = scratch;
+            }
+          }
           if (configuredModel.length > 0) {
             const selector = findModelConfigSelector(sessionConfigOptions);
             if (!selector) {
