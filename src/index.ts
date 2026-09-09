@@ -12,6 +12,7 @@ import { ProcessManager } from "./orchestration/process-manager.js";
 import { VerificationService } from "./verification/verification-service.js";
 import { TaskManager } from "./orchestration/task-manager.js";
 import { createMcpServer } from "./server/mcp-server.js";
+import { createT3Client } from "./t3/t3-client.js";
 
 async function main() {
   const args = process.argv.slice(2);
@@ -83,6 +84,8 @@ async function main() {
     auditStore
   );
 
+  const t3Client = createT3Client(config.t3);
+
   const server = createMcpServer({
     agentRegistry,
     repoRegistry,
@@ -90,6 +93,7 @@ async function main() {
     gitService,
     verificationService,
     workspaceManager,
+    t3Client,
   });
 
   const transport = new StdioServerTransport();

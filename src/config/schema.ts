@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { T3ConfigSchema } from "../t3/t3-config.js";
 
 export const VerificationProfileConfigSchema = z.object({
   command: z.array(z.string()).min(1, "Verification profile command must not be empty"),
@@ -128,6 +129,9 @@ export const AppConfigSchema = z.object({
       },
     }),
   repositories: z.record(z.string(), RepositoryConfigSchema).default({}),
+  // T3 orchestration integration (Phase 1, additive, opt-in).
+  // Disabled by default so existing installations are unaffected.
+  t3: T3ConfigSchema.optional(),
 });
 
 export type VerificationProfileConfig = z.infer<typeof VerificationProfileConfigSchema>;

@@ -8,6 +8,8 @@ import { VerificationService } from "../verification/verification-service.js";
 import { WorkspaceManager } from "../repositories/workspace-manager.js";
 import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 import { assertPathContained } from "../security/path-policy.js";
+import { T3Client } from "../t3/t3-client.js";
+import { registerT3Tools } from "../t3/t3-tools.js";
 
 export interface ToolServices {
   agentRegistry: AgentRegistry;
@@ -16,6 +18,8 @@ export interface ToolServices {
   gitService: GitService;
   verificationService: VerificationService;
   workspaceManager: WorkspaceManager;
+  /** T3 client — null when T3 integration is disabled (t3.enabled: false). */
+  t3Client?: T3Client | null;
 }
 
 function handleToolError(err: unknown) {
@@ -362,4 +366,11 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       }
     }
   );
+
+  // Register additive T3 orchestration tools (Phase 1).
+  // These are separate from the legacy direct-agent tools above.
+  registerT3Tools(server, {
+    t3Client: services.t3Client ?? null,
+    repoRegistry: services.repoRegistry,
+  });
 }
