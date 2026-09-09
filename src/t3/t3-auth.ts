@@ -98,12 +98,13 @@ export async function authorizeThread(
 }
 
 /**
- * Checks whether the T3 thread is using a worktree workspace strategy
- * (i.e., thread.branch != null OR thread.worktreePath != null).
+ * Checks whether the T3 thread is using a worktree workspace strategy.
  *
- * This is an approximation for Phase 1: T3 sets branch/worktreePath when
- * prepareWorktree was used. An in-place thread has both as null.
+ * In Phase 1, execution isolation requires that worktreePath is non-null.
+ * A branch alone is source-control metadata and is NOT sufficient evidence
+ * that execution is isolated from the configured repository root.
  */
 export function isWorktreeThread(thread: T3SnapshotThread): boolean {
-  return thread.branch !== null || thread.worktreePath !== null;
+  return thread.worktreePath != null;
 }
+

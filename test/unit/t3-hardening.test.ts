@@ -160,7 +160,9 @@ function buildThread(overrides: {
   branch?: string | null;
   worktreePath?: string | null;
   activeTurnId?: string | null;
-  modelOptions?: Record<string, unknown>;
+  modelOptions?:
+    | ReadonlyArray<{ id: string; value: string | boolean }>
+    | Record<string, unknown>;
 }) {
   return {
     id: overrides.id ?? crypto.randomUUID(),
@@ -659,13 +661,18 @@ test("isWorktreeThread returns false for thread with branch=null and worktreePat
   assert.equal(isWorktreeThread(thread as any), false);
 });
 
-test("isWorktreeThread returns true for thread with branch set", () => {
+test("isWorktreeThread: branch != null + worktreePath == null => false", () => {
   const thread = buildThread({ branch: "task/br", worktreePath: null });
+  assert.equal(isWorktreeThread(thread as any), false);
+});
+
+test("isWorktreeThread: branch == null + worktreePath != null => true", () => {
+  const thread = buildThread({ branch: null, worktreePath: "/tmp/wt" });
   assert.equal(isWorktreeThread(thread as any), true);
 });
 
-test("isWorktreeThread returns true for thread with worktreePath set", () => {
-  const thread = buildThread({ branch: null, worktreePath: "/tmp/wt" });
+test("isWorktreeThread: branch != null + worktreePath != null => true", () => {
+  const thread = buildThread({ branch: "task/br", worktreePath: "/tmp/wt" });
   assert.equal(isWorktreeThread(thread as any), true);
 });
 
@@ -1706,4 +1713,448 @@ test("t3_status via MCP client returns all required diagnostic fields", async ()
     fs.rmSync(configuredDir, { recursive: true, force: true });
   }
 });
+
+test("t3_continue_task preserves canonical array modelSelection.options when no model override", async () => {
+  const threadId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
+  const configuredDir = makeTmpRepoDir();
+
+  const canonicalOptions = [
+    { id: "reasoningEffort", value: "high" },
+    { id: "fastMode", value: true },
+  ] as const;
+
+  const routes: MockRoute[] = [
+    {
+      method: "GET",
+      path: `/api/orchestration/threads/${threadId}`,
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 5,
+          thread: buildThread({
+            id: threadId,
+            projectId,
+            branch: "task/test",
+            worktreePath: "/tmp/wt",
+            modelOptions: canonicalOptions,
+          }),
+        },
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/orchestration/snapshot",
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 5,
+          projects: [{ id: projectId, workspaceRoot: configuredDir, title: "test-repo" }],
+          threads: [],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/orchestration/dispatch",
+      response: { status: 200, body: { sequence: 6 } },
+    },
+  ];
+
+  const { server, baseUrl } = await startMockServer(routes);
+  const config = makeAppConfig({ root: configuredDir, writable: true });
+  const repoRegistry = new RepositoryRegistry(config);
+
+  try {
+    await withToken("test-token-model-canonical", async () => {
+      const client = new T3Client(makeConfig(baseUrl));
+      const snap = await client.getThreadSnapshot(threadId, { turnLimit: 1 });
+      const thread = snap.thread;
+
+      assert.deepEqual(thread.modelSelection.options, canonicalOptions);
+
+      // Preserves full modelSelection when no override
+      const modelSelection = { ...thread.modelSelection };
+      assert.deepEqual(modelSelection.options, canonicalOptions);
+
+      // Drops options when override is provided
+      const overriddenSelection = { instanceId: thread.modelSelection.instanceId, model: "other-model" };
+      assert.equal(overriddenSelection.model, "other-model");
+      assert.ok(!("options" in overriddenSelection));
+    });
+  } finally {
+    await stopServer(server);
+    fs.rmSync(configuredDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Branch-only thread regression tests (branch != null, worktreePath == null)
+// Proves branch alone is NOT sufficient isolation evidence.
+// ---------------------------------------------------------------------------
+
+test("t3_continue_task via MCP client rejects configured branch-only thread (worktreePath == null)", async () => {
+  const configuredDir = makeTmpRepoDir();
+  const threadId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
+
+  const routes: MockRoute[] = [
+    {
+      method: "GET",
+      path: `/api/orchestration/threads/${threadId}`,
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          // Branch is set, but worktreePath is null -> in-place execution, not isolated
+          thread: buildThread({ id: threadId, projectId, branch: "feature/branch-only", worktreePath: null }),
+        },
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/orchestration/snapshot",
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          projects: [{ id: projectId, workspaceRoot: configuredDir, title: "test-repo" }],
+          threads: [],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    },
+  ];
+
+  const { server, baseUrl } = await startMockServer(routes);
+  try {
+    await withToken("mcp-test-token", async () => {
+      const config = makeAppConfig({ root: configuredDir, writable: true });
+      const repoRegistry = new RepositoryRegistry(config);
+      const t3Client = new T3Client(makeConfig(baseUrl));
+      const { mcpClient } = await setupMcpClientWithT3(t3Client, repoRegistry);
+
+      const result = await mcpClient.callTool({
+        name: "t3_continue_task",
+        arguments: {
+          thread_id: threadId,
+          instruction: "continue work on branch-only",
+        },
+      });
+
+      assert.equal(result.isError, true);
+      const content = JSON.parse((result.content as any)[0].text);
+      assert.equal(content.error.code, ErrorCodes.POLICY_DENIED);
+      assert.ok(content.error.message.includes("in-place"));
+    });
+  } finally {
+    await stopServer(server);
+    fs.rmSync(configuredDir, { recursive: true, force: true });
+  }
+});
+
+test("t3_respond_approval via MCP client rejects configured branch-only thread (worktreePath == null)", async () => {
+  const configuredDir = makeTmpRepoDir();
+  const threadId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
+
+  const routes: MockRoute[] = [
+    {
+      method: "GET",
+      path: `/api/orchestration/threads/${threadId}`,
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          thread: buildThread({ id: threadId, projectId, branch: "feature/branch-only", worktreePath: null }),
+        },
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/orchestration/snapshot",
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          projects: [{ id: projectId, workspaceRoot: configuredDir, title: "test-repo" }],
+          threads: [],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    },
+  ];
+
+  const { server, baseUrl } = await startMockServer(routes);
+  try {
+    await withToken("mcp-test-token", async () => {
+      const config = makeAppConfig({ root: configuredDir, writable: true });
+      const repoRegistry = new RepositoryRegistry(config);
+      const t3Client = new T3Client(makeConfig(baseUrl));
+      const { mcpClient } = await setupMcpClientWithT3(t3Client, repoRegistry);
+
+      const result = await mcpClient.callTool({
+        name: "t3_respond_approval",
+        arguments: {
+          thread_id: threadId,
+          request_id: "req-branch-only",
+          decision: "accept",
+        },
+      });
+
+      assert.equal(result.isError, true);
+      const content = JSON.parse((result.content as any)[0].text);
+      assert.equal(content.error.code, ErrorCodes.POLICY_DENIED);
+    });
+  } finally {
+    await stopServer(server);
+    fs.rmSync(configuredDir, { recursive: true, force: true });
+  }
+});
+
+test("t3_respond_user_input via MCP client rejects configured branch-only thread (worktreePath == null)", async () => {
+  const configuredDir = makeTmpRepoDir();
+  const threadId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
+
+  const routes: MockRoute[] = [
+    {
+      method: "GET",
+      path: `/api/orchestration/threads/${threadId}`,
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          thread: buildThread({ id: threadId, projectId, branch: "feature/branch-only", worktreePath: null }),
+        },
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/orchestration/snapshot",
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          projects: [{ id: projectId, workspaceRoot: configuredDir, title: "test-repo" }],
+          threads: [],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    },
+  ];
+
+  const { server, baseUrl } = await startMockServer(routes);
+  try {
+    await withToken("mcp-test-token", async () => {
+      const config = makeAppConfig({ root: configuredDir, writable: true });
+      const repoRegistry = new RepositoryRegistry(config);
+      const t3Client = new T3Client(makeConfig(baseUrl));
+      const { mcpClient } = await setupMcpClientWithT3(t3Client, repoRegistry);
+
+      const result = await mcpClient.callTool({
+        name: "t3_respond_user_input",
+        arguments: {
+          thread_id: threadId,
+          request_id: "req-branch-only",
+          answers: { answer: "yes" },
+        },
+      });
+
+      assert.equal(result.isError, true);
+      const content = JSON.parse((result.content as any)[0].text);
+      assert.equal(content.error.code, ErrorCodes.POLICY_DENIED);
+    });
+  } finally {
+    await stopServer(server);
+    fs.rmSync(configuredDir, { recursive: true, force: true });
+  }
+});
+
+test("t3_get_task via MCP client succeeds for configured branch-only thread", async () => {
+  const configuredDir = makeTmpRepoDir();
+  const threadId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
+
+  const routes: MockRoute[] = [
+    {
+      method: "GET",
+      path: `/api/orchestration/threads/${threadId}`,
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          thread: buildThread({ id: threadId, projectId, branch: "feature/branch-only", worktreePath: null }),
+        },
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/orchestration/snapshot",
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          projects: [{ id: projectId, workspaceRoot: configuredDir, title: "test-repo" }],
+          threads: [],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    },
+  ];
+
+  const { server, baseUrl } = await startMockServer(routes);
+  try {
+    await withToken("mcp-test-token", async () => {
+      const config = makeAppConfig({ root: configuredDir });
+      const repoRegistry = new RepositoryRegistry(config);
+      const t3Client = new T3Client(makeConfig(baseUrl));
+      const { mcpClient } = await setupMcpClientWithT3(t3Client, repoRegistry);
+
+      const result = await mcpClient.callTool({
+        name: "t3_get_task",
+        arguments: { thread_id: threadId },
+      });
+
+      assert.equal(result.isError, undefined);
+      const content = JSON.parse((result.content as any)[0].text);
+      assert.equal(content.thread_id, threadId);
+      assert.equal(content.branch, "feature/branch-only");
+      assert.equal(content.worktree_path, null);
+    });
+  } finally {
+    await stopServer(server);
+    fs.rmSync(configuredDir, { recursive: true, force: true });
+  }
+});
+
+test("t3_cancel_task via MCP client succeeds for configured branch-only thread", async () => {
+  const configuredDir = makeTmpRepoDir();
+  const threadId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
+
+  const routes: MockRoute[] = [
+    {
+      method: "GET",
+      path: `/api/orchestration/threads/${threadId}`,
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          thread: buildThread({
+            id: threadId,
+            projectId,
+            branch: "feature/branch-only",
+            worktreePath: null,
+            activeTurnId: "turn-branch-only",
+          }),
+        },
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/orchestration/snapshot",
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          projects: [{ id: projectId, workspaceRoot: configuredDir, title: "test-repo" }],
+          threads: [],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/orchestration/dispatch",
+      response: { status: 200, body: { sequence: 10 } },
+    },
+  ];
+
+  const { server, baseUrl } = await startMockServer(routes);
+  try {
+    await withToken("mcp-test-token", async () => {
+      const config = makeAppConfig({ root: configuredDir });
+      const repoRegistry = new RepositoryRegistry(config);
+      const t3Client = new T3Client(makeConfig(baseUrl));
+      const { mcpClient } = await setupMcpClientWithT3(t3Client, repoRegistry);
+
+      const result = await mcpClient.callTool({
+        name: "t3_cancel_task",
+        arguments: { thread_id: threadId },
+      });
+
+      assert.equal(result.isError, undefined);
+      const content = JSON.parse((result.content as any)[0].text);
+      assert.equal(content.thread_id, threadId);
+      assert.equal(content.turn_id_interrupted, "turn-branch-only");
+    });
+  } finally {
+    await stopServer(server);
+    fs.rmSync(configuredDir, { recursive: true, force: true });
+  }
+});
+
+test("t3_stop_session via MCP client succeeds for configured branch-only thread", async () => {
+  const configuredDir = makeTmpRepoDir();
+  const threadId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
+
+  const routes: MockRoute[] = [
+    {
+      method: "GET",
+      path: `/api/orchestration/threads/${threadId}`,
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          thread: buildThread({ id: threadId, projectId, branch: "feature/branch-only", worktreePath: null }),
+        },
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/orchestration/snapshot",
+      response: {
+        status: 200,
+        body: {
+          snapshotSequence: 1,
+          projects: [{ id: projectId, workspaceRoot: configuredDir, title: "test-repo" }],
+          threads: [],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/orchestration/dispatch",
+      response: { status: 200, body: { sequence: 11 } },
+    },
+  ];
+
+  const { server, baseUrl } = await startMockServer(routes);
+  try {
+    await withToken("mcp-test-token", async () => {
+      const config = makeAppConfig({ root: configuredDir });
+      const repoRegistry = new RepositoryRegistry(config);
+      const t3Client = new T3Client(makeConfig(baseUrl));
+      const { mcpClient } = await setupMcpClientWithT3(t3Client, repoRegistry);
+
+      const result = await mcpClient.callTool({
+        name: "t3_stop_session",
+        arguments: { thread_id: threadId },
+      });
+
+      assert.equal(result.isError, undefined);
+      const content = JSON.parse((result.content as any)[0].text);
+      assert.equal(content.thread_id, threadId);
+      assert.equal(content.status, "session_stop_dispatched");
+    });
+  } finally {
+    await stopServer(server);
+    fs.rmSync(configuredDir, { recursive: true, force: true });
+  }
+});
+
 

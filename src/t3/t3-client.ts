@@ -19,12 +19,18 @@ import { T3Config } from "./t3-config.js";
 // Kept minimal — only fields we actually consume in Phase 1.
 // --------------------------------------------------------------------------
 
-/** T3 ModelSelection — includes optional per-instance options. */
+/** T3 ModelSelection — includes optional per-instance options matching canonical T3 wire shape. */
 export interface T3ModelSelection {
   instanceId: string;
   model: string;
-  /** Provider-specific option overrides, preserved on continue. */
-  options?: Record<string, unknown>;
+  /** Provider-specific option overrides matching canonical T3 wire shape. */
+  options?:
+    | ReadonlyArray<{
+        id: string;
+        value: string | boolean;
+      }>
+    | Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export interface T3SnapshotProject {
