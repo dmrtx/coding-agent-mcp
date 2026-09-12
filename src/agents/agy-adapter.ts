@@ -204,6 +204,11 @@ export class AgyAdapter implements CodingAgent {
 
     const args: string[] = [
       ...this.commandPrefixArgs,
+      // With an isolated HOME, AGY 1.2.x otherwise treats that profile home
+      // as the implicit project for ListDir. Pin the actual task worktree as
+      // an active workspace so `read_file(.)` resolves to the repository.
+      "--add-dir",
+      input.workspaceRoot,
       "--print",
       input.instruction,
       "--output-format",
@@ -245,6 +250,8 @@ export class AgyAdapter implements CodingAgent {
 
     const args: string[] = [
       ...this.commandPrefixArgs,
+      "--add-dir",
+      input.workspaceRoot,
       "--print",
       input.instruction,
       "--output-format",

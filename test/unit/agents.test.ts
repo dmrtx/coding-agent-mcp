@@ -93,6 +93,7 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
     });
 
     assert.ok(spawnInfo.args.includes("--sandbox"), "AGY must be executed with --sandbox enabled");
+    assert.equal(spawnInfo.args[spawnInfo.args.indexOf("--add-dir") + 1], tmpWorkspace);
     assert.ok(spawnInfo.args.includes("--output-format"), "AGY must specify output-format");
     assert.equal(spawnInfo.args[spawnInfo.args.indexOf("--output-format") + 1], "json");
     assert.ok(!spawnInfo.args.includes("--dangerously-skip-permissions"), "AGY must NOT include --dangerously-skip-permissions");
@@ -148,6 +149,7 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
       "conv-real-9999"
     );
     assert.ok(!continueSpawn.args.includes("--continue"), "AGY continue must not fall back to global --continue");
+    assert.equal(continueSpawn.args[continueSpawn.args.indexOf("--add-dir") + 1], tmpWorkspace);
     assert.ok(continueSpawn.args.includes("--mode"));
     assert.equal(continueSpawn.args[continueSpawn.args.indexOf("--mode") + 1], "plan");
 
@@ -211,7 +213,12 @@ test("AGY Gemini runs the CLI through Gyro with an isolated API-key profile", as
       "--agy-path",
       "/opt/bin/agy",
       "--",
+      "--add-dir",
+    ]);
+    assert.deepEqual(spawnInfo.args.slice(6, 9), [
+      "/workspace",
       "--print",
+      "inspect only",
     ]);
     assert.ok(spawnInfo.args.includes("--model"));
     assert.equal(spawnInfo.args[spawnInfo.args.indexOf("--model") + 1], "gemini-test-model");
