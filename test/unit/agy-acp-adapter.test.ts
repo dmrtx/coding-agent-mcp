@@ -178,6 +178,39 @@ test("isolated env forces file credential storage and ignores host override", ()
   }
 });
 
+test("gemini-api-key mode preserves only an explicitly supplied Gemini API key", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-api-key-"));
+  try {
+    const adapter = new AgyAcpAdapter(
+      makeConfig({ state_dir: stateDir, auth_method: "gemini-api-key" })
+    );
+    const { env } = adapter.buildIsolatedEnv("task_api_key_1", {
+      GEMINI_API_KEY: "explicit-test-key",
+      GOOGLE_API_KEY: "must-not-pass",
+      ANTIGRAVITY_TOKEN: "must-not-pass",
+    });
+    assert.equal(env.GEMINI_API_KEY, "explicit-test-key");
+    assert.equal(env.GOOGLE_API_KEY, undefined);
+    assert.equal(env.ANTIGRAVITY_TOKEN, undefined);
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("configured ACP wrapper arguments are used when a turn supplies none", async () => {
+  assert.ok(fs.existsSync(FIXTURE), `fake kernel fixture must exist at ${FIXTURE}`);
+  const adapter = new AgyAcpAdapter(
+    makeConfig({ acp_executable: process.execPath, acp_args: [FIXTURE] })
+  );
+  const result = await adapter.runAcpTurn({
+    prompt: "wrapper args",
+    timeoutMs: 15_000,
+    mode: "review",
+  });
+  assert.ok(result.sessionId.startsWith("sess-"));
+  assert.equal(result.stopReason, "end_turn");
+});
+
 test("isolated env never copies host HOME credentials", () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-nohost-"));
   const mockHome = path.join(tmpBase, "mock-home");
@@ -219,6 +252,27 @@ test("fake-kernel turn captures sessionId, assistant text, and stopReason", asyn
     assert.ok(result.sessionId.startsWith("sess-"), `expected sess-* id, got ${result.sessionId}`);
     assert.equal(result.stopReason, "end_turn");
     assert.equal(typeof result.assistantText, "string");
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("official-shaped session/update chunks supply assistant text when prompt result has none", async () => {
+  assert.ok(fs.existsSync(FIXTURE), `fake kernel fixture must exist at ${FIXTURE}`);
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-stream-ws-"));
+  fs.writeFileSync(path.join(workspace, "README.md"), "# test\n");
+  try {
+    const adapter = new AgyAcpAdapter(makeConfig({ acp_executable: process.execPath }));
+    const result = await adapter.runAcpTurn({
+      executable: process.execPath,
+      args: [FIXTURE],
+      prompt: "read the readme [[STREAM_ONLY]]",
+      timeoutMs: 15_000,
+      workspaceRoot: workspace,
+      mode: "review",
+    });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(result.assistantText, "fake assistant update: reading README.md");
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }

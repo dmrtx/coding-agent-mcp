@@ -1,17 +1,20 @@
-# `agy-acp` — Experimental Antigravity ACP Foundation (Phase 1)
+# `agy-acp` — Experimental Antigravity ACP Adapter
 
-> Status: foundation only. ACP execution is **not** wired into `start_task`
-> yet, and the legacy `agy` adapter remains the default.
+> Status: opt-in. ACP execution is wired into the managed `TaskManager`
+> lifecycle, while the legacy `agy` adapter remains available independently.
 
 ## What exists in phase 1
 
 - Disabled-by-default `agents.agy-acp` configuration (`enabled: false`):
-  `acp_executable`, `auth_method`
+  `acp_executable`, optional wrapper `acp_args`, `auth_method`
   (`oauth-personal` | `oauth-business` | `gemini-api-key` | `agent-platform`),
   optional `model`, `mode` (`default` | `auto_edit` | `yolo`),
   `allow_write_worktree` (default `false`), `state_dir`,
   `default_timeout_seconds`, `env_allowlist`. Config validation rejects the
   unsafe combination `mode: yolo` unless `allow_write_worktree: true`.
+  When `auth_method: gemini-api-key`, an explicitly allowlisted
+  `GEMINI_API_KEY` is forwarded to the isolated ACP process; all ambient
+  Google/Gemini/Antigravity credentials remain stripped in other modes.
 - Dependency-light ACP JSON-RPC/NDJSON protocol client under
   `src/agents/acp/` (incremental framing with bounded line size, numeric
   request ids with timeouts, response/notification/inbound-request handling,
@@ -36,13 +39,12 @@ operator (point `agents.agy-acp.acp_executable` at it). This project ships
 **no downloader** and redistributes **no kernel**. Authentication material
 lives with the operator; phase 1 stores nothing.
 
-## What is NOT true yet
+## Current limitations
 
-- `start_task` / `continue_task` cannot run `agy-acp` (no `AgyAcpAdapter`,
-  no TaskManager/ProcessManager lifecycle, auth setup, or transcript
-  plumbing).
+- The project does not install or update the ACP kernel or optional wrappers.
+- Real-provider authentication and model availability remain operator-managed.
 - The `session/request_permission` inbound shape used by the fake kernel is
-  a phase 1 test convention for exercising the protocol client, not a
+  a test convention for exercising the protocol client, not a
   compatibility claim about the real server.
 
 See `examples/config.example.yaml` for an annotated (disabled) example.

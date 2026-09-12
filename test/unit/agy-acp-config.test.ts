@@ -12,6 +12,7 @@ test("agy-acp config is disabled by default with safe values", () => {
   const acp = parsed.agents["agy-acp"];
   assert.equal(acp.enabled, false);
   assert.equal(acp.acp_executable, "agy_acp_server");
+  assert.deepEqual(acp.acp_args, []);
   assert.equal(acp.auth_method, "oauth-personal");
   assert.equal(acp.model, undefined);
   assert.equal(acp.mode, "default");
@@ -63,6 +64,10 @@ test("agy-acp rejects invalid auth_method and mode values", () => {
   }
   const withModel = AgyAcpConfigSchema.parse({ model: "antigravity-gemini-3-pro" });
   assert.equal(withModel.model, "antigravity-gemini-3-pro");
+  const wrapped = AgyAcpConfigSchema.parse({
+    acp_args: ["--agy-path", "/opt/bin/agy_acp_server", "--"],
+  });
+  assert.deepEqual(wrapped.acp_args, ["--agy-path", "/opt/bin/agy_acp_server", "--"]);
 });
 
 test("loadConfig parses an agy-acp YAML block and absolutizes state_dir", () => {

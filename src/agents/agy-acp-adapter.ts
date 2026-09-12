@@ -436,7 +436,7 @@ export class AgyAcpAdapter implements CodingAgent {
     chmodBestEffort(profileDir, 0o700);
     chmodBestEffort(geminiHome, 0o700);
 
-    const env: Record<string, string> = stripCredentialEnv(baseEnv);
+    const env = this.buildCredentialEnv(baseEnv);
     // Explicit overrides win over anything ambient; host HOME is never reused.
     env.HOME = homeDir;
     env.GEMINI_HOME = geminiHome;
@@ -458,6 +458,20 @@ export class AgyAcpAdapter implements CodingAgent {
   private getAuthMethodId(): string {
     const raw = (this.config as { auth_method?: unknown }).auth_method;
     return typeof raw === "string" && raw.length > 0 ? raw : "oauth-personal";
+  }
+
+  /**
+   * Keep an explicitly allowlisted Gemini API key only for the matching
+   * authentication mode. OAuth and every other mode continue stripping all
+   * ambient Google/Gemini/Antigravity credentials.
+   */
+  private buildCredentialEnv(source: Record<string, string>): Record<string, string> {
+    const env = stripCredentialEnv(source);
+    const apiKey = source.GEMINI_API_KEY?.trim();
+    if (this.getAuthMethodId() === "gemini-api-key" && apiKey) {
+      env.GEMINI_API_KEY = apiKey;
+    }
+    return env;
   }
 
   private static extractToolCall(params: unknown): AcpToolCallShape | undefined {
@@ -612,7 +626,7 @@ export class AgyAcpAdapter implements CodingAgent {
     // availability probe does; anything else passes through untouched.
     const executable = expandHomeDir(configured);
 
-    const args = options.args ?? [];
+    const args = options.args ?? this.config.acp_args ?? [];
     const cwd = options.cwd ?? process.cwd();
     const timeoutMs =
       options.timeoutMs ?? (this.config.default_timeout_seconds ?? 1800) * 1000;
@@ -628,7 +642,7 @@ export class AgyAcpAdapter implements CodingAgent {
     let spawnEnv: Record<string, string>;
     let isolatedGeminiHome: string | undefined;
     if (options.env) {
-      spawnEnv = stripCredentialEnv(options.env);
+      spawnEnv = this.buildCredentialEnv(options.env);
       const candidate = spawnEnv.GEMINI_HOME;
       if (typeof candidate === "string" && candidate.length > 0 && path.isAbsolute(candidate)) {
         isolatedGeminiHome = candidate;
@@ -638,7 +652,7 @@ export class AgyAcpAdapter implements CodingAgent {
       spawnEnv = isolated.env;
       isolatedGeminiHome = isolated.geminiHome;
     } else {
-      spawnEnv = stripCredentialEnv(options.baseEnv ?? {});
+      spawnEnv = this.buildCredentialEnv(options.baseEnv ?? {});
       const candidate = spawnEnv.GEMINI_HOME;
       if (typeof candidate === "string" && candidate.length > 0 && path.isAbsolute(candidate)) {
         isolatedGeminiHome = candidate;
@@ -715,6 +729,8 @@ export class AgyAcpAdapter implements CodingAgent {
 
     return await new Promise<AcpTurnResult>((resolve, reject) => {
       let settled = false;
+      let establishedSessionId: string | undefined;
+      const assistantChunks: string[] = [];
       // Turn start for the safely bounded `session/prompt` request timeout
       // below (remaining overall time, floored so a slow handshake cannot
       // produce a degenerate zero timeout).
@@ -736,6 +752,30 @@ export class AgyAcpAdapter implements CodingAgent {
             throw new Error(`Unsupported inbound ACP request: '${method}'`);
           }
           return this.decidePermissionRequest(params, permissionContext);
+        },
+        onNotification: (method, params) => {
+          if (
+            method !== "session/update" ||
+            params === null ||
+            typeof params !== "object" ||
+            Array.isArray(params)
+          ) {
+            return;
+          }
+          const notification = params as Record<string, unknown>;
+          if (
+            establishedSessionId === undefined ||
+            notification.sessionId !== establishedSessionId ||
+            notification.update === null ||
+            typeof notification.update !== "object" ||
+            Array.isArray(notification.update)
+          ) {
+            return;
+          }
+          const update = notification.update as Record<string, unknown>;
+          if (update.sessionUpdate !== "agent_message_chunk") return;
+          const text = extractAssistantText(update.content);
+          if (text.length > 0) assistantChunks.push(text);
         },
       });
       if (activeTurn) activeTurn.client = client;
@@ -936,6 +976,7 @@ export class AgyAcpAdapter implements CodingAgent {
             sessionId = rawSessionId.trim();
             sessionConfigOptions = created.configOptions;
           }
+          establishedSessionId = sessionId;
           if (activeTurn) activeTurn.sessionId = sessionId;
           // Bind the agent-internal scratch root to the exact established
           // session id (never to an inbound claimed id): permission probes
@@ -995,7 +1036,12 @@ export class AgyAcpAdapter implements CodingAgent {
             typeof rawStopReason === "string" && rawStopReason.trim().length > 0
               ? rawStopReason.trim()
               : "unknown";
-          settleResolve({ sessionId, assistantText: extractAssistantText(answer), stopReason });
+          const resultText = extractAssistantText(answer);
+          settleResolve({
+            sessionId,
+            assistantText: resultText.length > 0 ? resultText : assistantChunks.join(""),
+            stopReason,
+          });
         } catch (err) {
           settleReject(err);
         }

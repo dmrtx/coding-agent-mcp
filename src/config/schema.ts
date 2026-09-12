@@ -26,11 +26,10 @@ export const AgentConfigSchema = z.object({
   extra_args: z.array(z.string()).optional(),
 });
 
-// Phase 1 (experimental, opt-in, disabled by default) foundation for the
-// additive Antigravity ACP integration. This configures how a future
-// AgyAcpAdapter would launch the operator-provided `agy_acp_server` binary
-// over ACP (JSON-RPC/NDJSON over stdio). It is NOT consumed by TaskManager
-// yet and legacy `agents.agy` behavior is unchanged.
+// Experimental, opt-in Antigravity ACP integration. The adapter launches an
+// operator-provided ACP kernel (optionally through a wrapper such as
+// `agy-gyro`) over JSON-RPC/NDJSON and is managed by TaskManager. Legacy
+// `agents.agy` behavior remains unchanged.
 export const AgyAcpAuthMethodSchema = z.enum([
   "oauth-personal",
   "oauth-business",
@@ -44,6 +43,7 @@ export const AgyAcpConfigSchema = z
   .object({
     enabled: z.boolean().default(false),
     acp_executable: z.string().min(1, "ACP executable path or command is required").default("agy_acp_server"),
+    acp_args: z.array(z.string()).default([]),
     auth_method: AgyAcpAuthMethodSchema.default("oauth-personal"),
     model: z.string().min(1).optional(),
     mode: AgyAcpModeSchema.default("default"),
@@ -63,6 +63,7 @@ export const AgyAcpConfigSchema = z
 export const AGY_ACP_CONFIG_DEFAULTS = {
   enabled: false,
   acp_executable: "agy_acp_server",
+  acp_args: [],
   auth_method: "oauth-personal",
   mode: "default",
   allow_write_worktree: false,
@@ -90,7 +91,7 @@ export const AppConfigSchema = z.object({
   // Known agent keys have dedicated schemas; any other agent key falls back
   // to the legacy generic AgentConfigSchema via catchall, preserving existing
   // behavior for custom agents. `agy-acp` is experimental, opt-in, and
-  // disabled by default (phase 1 foundation only; not wired into TaskManager).
+  // disabled by default.
   //
   // Omission semantics match the historical z.record shape exactly: an
   // explicitly provided `agents` object keeps ONLY the keys the operator
@@ -124,6 +125,7 @@ export const AppConfigSchema = z.object({
       },
       "agy-acp": {
         ...AGY_ACP_CONFIG_DEFAULTS,
+        acp_args: [...AGY_ACP_CONFIG_DEFAULTS.acp_args],
         env_allowlist: [...AGY_ACP_CONFIG_DEFAULTS.env_allowlist],
       },
     }),

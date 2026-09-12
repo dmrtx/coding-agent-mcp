@@ -237,7 +237,12 @@ function handleRequest(msg) {
       // the client answers (allow, deny, or JSON-RPC error — all complete).
       permissionCounter += 1;
       const permId = permissionCounter;
-      pendingPrompts.set(permId, { origId: id, sessionId, kind: "read" });
+      pendingPrompts.set(permId, {
+        origId: id,
+        sessionId,
+        kind: "read",
+        streamOnly: promptText.includes("[[STREAM_ONLY]]"),
+      });
       send({
         jsonrpc: "2.0",
         id: permId,
@@ -363,7 +368,9 @@ function handleResponse(msg) {
       stopReason: "end_turn",
       sessionId: pending.sessionId,
       permissionOutcome: outcome,
-      assistantText: "fake assistant completed turn for read probe",
+      ...(pending.streamOnly
+        ? {}
+        : { assistantText: "fake assistant completed turn for read probe" }),
     },
   });
 }
