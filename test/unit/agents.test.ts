@@ -171,6 +171,44 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
   }
 });
 
+test("account-backed AGY can explicitly reuse host HOME for macOS Keychain", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "agy-host-home-test-"));
+  const hostHome = path.join(tmpBase, "real-home");
+  fs.mkdirSync(hostHome);
+  const adapter = new AgyAdapter(
+    {
+      enabled: true,
+      executable: "agy",
+      sandbox: true,
+      use_host_home: true,
+      default_timeout_seconds: 1800,
+      env_allowlist: ["HOME", "PATH"],
+    },
+    path.join(tmpBase, "data")
+  );
+
+  try {
+    const spawnInfo = await adapter.prepareStart({
+      taskId: "task-host-home",
+      repositoryRoot: "/repo",
+      workspaceRoot: "/workspace",
+      instruction: "inspect only",
+      mode: "investigate",
+      timeoutMs: 60_000,
+      environment: { HOME: hostHome, PATH: "/usr/bin:/bin" },
+    });
+
+    assert.equal(spawnInfo.env.HOME, hostHome);
+    assert.equal(
+      fs.existsSync(path.join(tmpBase, "data", "agent-homes", "agy", "task-host-home")),
+      false,
+      "host-HOME mode must not create an isolated profile"
+    );
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
 test("AGY Gemini runs the CLI through Gyro with an isolated API-key profile", async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gemini-test-"));
   const adapter = new AgyAdapter(

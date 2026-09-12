@@ -45,6 +45,7 @@
     - `trustedWorkspaces: [<workspaceRoot>]`
     - Granular permissions allowlist: exactly `read_file(.)` plus safe build and test commands (`git`, `npm test`, `npm run lint`, etc.). Per the official AGY permissions docs, rule targets match absolute paths or paths relative to workspace roots and grant recursive reads of contained files/folders — never globs, `read_file(*)`, or write grants. Because this adapter configures exactly one trusted workspace and spawns with cwd set to it, `.` resolves unambiguously to the assigned workspace, and no operator-controlled path characters ever enter the rule string.
   - **Fail-closed configuration**: If the isolated directory cannot be created, task execution rejects immediately with `POLICY_DENIED`. It never falls back to the host `HOME` or host credentials.
+  - **Host Keychain opt-in**: Account-backed AGY can set `use_host_home: true` to reuse the operator's real profile and macOS login Keychain. This avoids Keychain lookup failures caused by a synthetic `HOME`, but exposes the host profile to AGY. The default remains isolated, and Gemini API mode never honors this option.
   - **Clean workspace**: Because the configuration lives under `agent-homes/agy/<task-id>`, credentials and configuration files never pollute the task workspace or leak in `get_repo_status` / `get_diff`.
   - `--sandbox` is explicitly enabled.
   - `--output-format json` emits structured output from which the real `conversation_id` is parsed and stored.

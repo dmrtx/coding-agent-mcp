@@ -32,6 +32,9 @@ agents:
     enabled: true
     executable: agy
     sandbox: true
+    # Opt in only when account OAuth must use the macOS login Keychain.
+    # Code changes remain isolated in worktrees, but AGY can access your HOME.
+    use_host_home: false
     default_timeout_seconds: 1800
     env_allowlist:
       - HOME

@@ -26,6 +26,13 @@ export const AgentConfigSchema = z.object({
   extra_args: z.array(z.string()).optional(),
 });
 
+// Account-backed AGY can optionally reuse the operator's real HOME so the
+// macOS Keychain remains available. This is opt-in because it deliberately
+// gives the agent access to the host profile instead of a per-task HOME.
+export const AgyConfigSchema = AgentConfigSchema.extend({
+  use_host_home: z.boolean().default(false),
+});
+
 // Direct AGY CLI execution through agy-gyro. This is intentionally separate
 // from both account-backed `agy` and the experimental ACP kernel adapter.
 export const AgyGeminiConfigSchema = AgentConfigSchema.extend({
@@ -113,14 +120,14 @@ export const AppConfigSchema = z.object({
   agents: z
     .object({
       muse: AgentConfigSchema.optional(),
-      agy: AgentConfigSchema.optional(),
+      agy: AgyConfigSchema.optional(),
       "agy-gemini": AgyGeminiConfigSchema.optional(),
       "agy-acp": AgyAcpConfigSchema.optional(),
     })
     // Union catchall: unknown agent keys keep legacy generic parsing, while
     // the union also keeps the object output (with its `agy-acp` member)
     // assignable for defaults.
-    .catchall(z.union([AgentConfigSchema, AgyGeminiConfigSchema, AgyAcpConfigSchema]))
+    .catchall(z.union([AgentConfigSchema, AgyConfigSchema, AgyGeminiConfigSchema, AgyAcpConfigSchema]))
     .default({
       muse: {
         enabled: true,
@@ -133,6 +140,7 @@ export const AppConfigSchema = z.object({
         enabled: true,
         executable: "agy",
         sandbox: true,
+        use_host_home: false,
         default_timeout_seconds: 1800,
         env_allowlist: ["HOME", "PATH", "TMPDIR", "USER", "SHELL", "LANG", "LC_ALL", "TERM"],
       },
@@ -157,6 +165,7 @@ export const AppConfigSchema = z.object({
 export type VerificationProfileConfig = z.infer<typeof VerificationProfileConfigSchema>;
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
+export type AgyConfig = z.infer<typeof AgyConfigSchema>;
 export type AgyGeminiConfig = z.infer<typeof AgyGeminiConfigSchema>;
 export type AgyAcpAuthMethod = z.infer<typeof AgyAcpAuthMethodSchema>;
 export type AgyAcpMode = z.infer<typeof AgyAcpModeSchema>;

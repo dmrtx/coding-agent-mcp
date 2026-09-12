@@ -17,14 +17,14 @@ import type { ErrorCode } from "../domain/errors.js";
 export class AgyAdapter implements CodingAgent {
   public readonly id: string;
   public readonly displayName: string;
-  private readonly config: AgentConfig;
+  private readonly config: AgentConfig & { use_host_home?: boolean };
   private readonly dataDir?: string;
   private readonly modelProvider: "default" | "gemini";
   private readonly commandPrefixArgs: string[];
   private readonly requiredExecutable?: string;
 
   constructor(
-    config: AgentConfig,
+    config: AgentConfig & { use_host_home?: boolean },
     dataDir?: string,
     options: {
       id?: string;
@@ -93,6 +93,21 @@ export class AgyAdapter implements CodingAgent {
     baseEnv: Record<string, string>
   ): Record<string, string> {
     try {
+      // A synthetic HOME makes Security.framework look for a non-existent
+      // login keychain. Account-backed AGY may explicitly reuse the host
+      // profile; Gemini API mode always remains isolated.
+      if (this.modelProvider !== "gemini" && this.config.use_host_home === true) {
+        const hostHome = baseEnv.HOME?.trim() || process.env.HOME || os.homedir();
+        if (!path.isAbsolute(hostHome)) {
+          throw new CodingAgentError(
+            ErrorCodes.POLICY_DENIED,
+            "AGY use_host_home requires an absolute host HOME path",
+            { taskId, hostHome }
+          );
+        }
+        return { ...baseEnv, HOME: hostHome };
+      }
+
       const dataDir = this.dataDir || path.join(os.tmpdir(), "coding-agent-mcp");
       const configDir = path.join(dataDir, "agent-homes", this.id, taskId);
       const agyCliDir = path.join(configDir, ".gemini", "antigravity-cli");
