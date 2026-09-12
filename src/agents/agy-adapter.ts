@@ -15,14 +15,32 @@ import { CodingAgentError, ErrorCodes } from "../domain/errors.js";
 import type { ErrorCode } from "../domain/errors.js";
 
 export class AgyAdapter implements CodingAgent {
-  public readonly id = "agy";
-  public readonly displayName = "AGY";
+  public readonly id: string;
+  public readonly displayName: string;
   private readonly config: AgentConfig;
   private readonly dataDir?: string;
+  private readonly modelProvider: "default" | "gemini";
+  private readonly commandPrefixArgs: string[];
+  private readonly requiredExecutable?: string;
 
-  constructor(config: AgentConfig, dataDir?: string) {
+  constructor(
+    config: AgentConfig,
+    dataDir?: string,
+    options: {
+      id?: string;
+      displayName?: string;
+      modelProvider?: "default" | "gemini";
+      commandPrefixArgs?: string[];
+      requiredExecutable?: string;
+    } = {}
+  ) {
     this.config = config;
     this.dataDir = dataDir;
+    this.id = options.id ?? "agy";
+    this.displayName = options.displayName ?? "AGY";
+    this.modelProvider = options.modelProvider ?? "default";
+    this.commandPrefixArgs = [...(options.commandPrefixArgs ?? [])];
+    this.requiredExecutable = options.requiredExecutable;
   }
 
   public async describe(): Promise<AgentDescriptor> {
@@ -46,6 +64,14 @@ export class AgyAdapter implements CodingAgent {
           else resolve(stdout.trim());
         });
       });
+      if (this.requiredExecutable) {
+        await new Promise<void>((resolve, reject) => {
+          execFile(this.requiredExecutable as string, ["--version"], (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+      }
       available = true;
       version = output;
     } catch {
@@ -68,7 +94,7 @@ export class AgyAdapter implements CodingAgent {
   ): Record<string, string> {
     try {
       const dataDir = this.dataDir || path.join(os.tmpdir(), "coding-agent-mcp");
-      const configDir = path.join(dataDir, "agent-homes", "agy", taskId);
+      const configDir = path.join(dataDir, "agent-homes", this.id, taskId);
       const agyCliDir = path.join(configDir, ".gemini", "antigravity-cli");
       fs.mkdirSync(agyCliDir, { recursive: true, mode: 0o700 });
       try {
@@ -87,6 +113,7 @@ export class AgyAdapter implements CodingAgent {
       // documented resolution — and no operator-controlled path characters
       // (')', whitespace, control codes) ever enter the rule string.
       const settings = {
+        ...(this.modelProvider === "gemini" ? { modelProvider: "gemini" } : {}),
         enableTerminalSandbox: true,
         toolPermission: "proceed-in-sandbox",
         allowNonWorkspaceAccess: false,
@@ -117,24 +144,49 @@ export class AgyAdapter implements CodingAgent {
         // Non-blocking
       }
 
-      // Copy authentication token from host if available
-      const userHome = process.env.HOME || os.homedir();
-      const hostToken = path.join(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
-      if (fs.existsSync(hostToken)) {
-        const destToken = path.join(agyCliDir, "antigravity-oauth-token");
-        fs.copyFileSync(hostToken, destToken);
-        try {
-          fs.chmodSync(destToken, 0o600);
-        } catch {
-          // Non-blocking
+      // Account-backed AGY may use a legacy file token when present. Gemini
+      // API mode never copies OAuth material and relies only on the explicit
+      // GEMINI_API_KEY supplied through the configured environment allowlist.
+      if (this.modelProvider !== "gemini") {
+        const userHome = process.env.HOME || os.homedir();
+        const hostToken = path.join(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+        if (fs.existsSync(hostToken)) {
+          const destToken = path.join(agyCliDir, "antigravity-oauth-token");
+          fs.copyFileSync(hostToken, destToken);
+          try {
+            fs.chmodSync(destToken, 0o600);
+          } catch {
+            // Non-blocking
+          }
         }
       }
 
-      return {
+      const env: Record<string, string> = {
         ...baseEnv,
         HOME: configDir,
       };
+      if (this.modelProvider === "gemini") {
+        const apiKey = baseEnv.GEMINI_API_KEY?.trim();
+        if (!apiKey) {
+          throw new CodingAgentError(
+            ErrorCodes.AGENT_NOT_AVAILABLE,
+            "AGY Gemini requires GEMINI_API_KEY in its explicit env_allowlist",
+            { agent: this.id }
+          );
+        }
+        for (const key of Object.keys(env)) {
+          if (
+            (key.startsWith("GOOGLE_") || key.startsWith("GEMINI_") || key.startsWith("ANTIGRAVITY_")) &&
+            key !== "GEMINI_API_KEY"
+          ) {
+            delete env[key];
+          }
+        }
+        env.GEMINI_API_KEY = apiKey;
+      }
+      return env;
     } catch (err: any) {
+      if (err instanceof CodingAgentError) throw err;
       // Fail-closed: Never fall back to host HOME
       throw new CodingAgentError(
         ErrorCodes.POLICY_DENIED,
@@ -151,6 +203,7 @@ export class AgyAdapter implements CodingAgent {
     const env = this.setupAgySettings(input.taskId, input.workspaceRoot, input.environment);
 
     const args: string[] = [
+      ...this.commandPrefixArgs,
       "--print",
       input.instruction,
       "--output-format",
@@ -191,6 +244,7 @@ export class AgyAdapter implements CodingAgent {
     const env = this.setupAgySettings(input.taskId, input.workspaceRoot, input.environment);
 
     const args: string[] = [
+      ...this.commandPrefixArgs,
       "--print",
       input.instruction,
       "--output-format",

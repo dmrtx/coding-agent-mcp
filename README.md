@@ -22,7 +22,7 @@ The MCP server is the safe execution, isolation, and verification boundary. Open
   - `get_diff`
   - `run_verification`
 - **Deterministic Verification**: Independent test and lint execution profiles returning real exit codes and outputs.
-- **Agent Adapters**: Pluggable adapters for Muse and AGY with headless execution, permission management, and session resumption.
+- **Agent Adapters**: Pluggable adapters for Muse and AGY with headless execution, permission management, and session resumption. The optional `agy-gemini` adapter runs the installed AGY CLI through `agy-gyro` with an isolated Gemini API-key profile, avoiding account OAuth and Keychain.
 - **Durable Persistence & Audit**: SQLite-backed task state, streaming logs, and structured audit logs with crash recovery.
 
 ---

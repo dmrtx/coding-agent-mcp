@@ -169,6 +169,106 @@ test("AgyAdapter constructs safe headless arguments with sandbox and json output
   }
 });
 
+test("AGY Gemini runs the CLI through Gyro with an isolated API-key profile", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gemini-test-"));
+  const adapter = new AgyAdapter(
+    {
+      enabled: true,
+      executable: "/opt/bin/agy-gyro",
+      sandbox: true,
+      default_timeout_seconds: 1800,
+      env_allowlist: ["PATH", "GEMINI_API_KEY"],
+      extra_args: ["--model", "gemini-test-model"],
+    },
+    tmpBase,
+    {
+      id: "agy-gemini",
+      displayName: "AGY Gemini (via Gyro)",
+      modelProvider: "gemini",
+      commandPrefixArgs: ["--max-retries", "9", "--agy-path", "/opt/bin/agy", "--"],
+    }
+  );
+  try {
+    const spawnInfo = await adapter.prepareStart({
+      taskId: "task-test-agy-gemini",
+      repositoryRoot: "/repo",
+      workspaceRoot: "/workspace",
+      instruction: "inspect only",
+      mode: "review",
+      timeoutMs: 60_000,
+      environment: {
+        PATH: "/usr/bin:/bin",
+        GEMINI_API_KEY: "explicit-test-key",
+        GOOGLE_API_KEY: "must-not-pass",
+        ANTIGRAVITY_TOKEN: "must-not-pass",
+      },
+    });
+
+    assert.equal(spawnInfo.command, "/opt/bin/agy-gyro");
+    assert.deepEqual(spawnInfo.args.slice(0, 6), [
+      "--max-retries",
+      "9",
+      "--agy-path",
+      "/opt/bin/agy",
+      "--",
+      "--print",
+    ]);
+    assert.ok(spawnInfo.args.includes("--model"));
+    assert.equal(spawnInfo.args[spawnInfo.args.indexOf("--model") + 1], "gemini-test-model");
+    assert.equal(spawnInfo.env.GEMINI_API_KEY, "explicit-test-key");
+    assert.equal(spawnInfo.env.GOOGLE_API_KEY, undefined);
+    assert.equal(spawnInfo.env.ANTIGRAVITY_TOKEN, undefined);
+    assert.ok(spawnInfo.env.HOME.includes(path.join("agent-homes", "agy-gemini")));
+
+    const settingsPath = path.join(
+      spawnInfo.env.HOME,
+      ".gemini",
+      "antigravity-cli",
+      "settings.json"
+    );
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    assert.equal(settings.modelProvider, "gemini");
+    assert.equal(
+      fs.existsSync(path.join(path.dirname(settingsPath), "antigravity-oauth-token")),
+      false
+    );
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("AGY Gemini fails before launch when GEMINI_API_KEY is absent", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gemini-no-key-"));
+  const adapter = new AgyAdapter(
+    {
+      enabled: true,
+      executable: "agy-gyro",
+      sandbox: true,
+      default_timeout_seconds: 1800,
+      env_allowlist: ["PATH", "GEMINI_API_KEY"],
+    },
+    tmpBase,
+    { id: "agy-gemini", modelProvider: "gemini" }
+  );
+  try {
+    await assert.rejects(
+      () =>
+        adapter.prepareStart({
+          taskId: "task-test-agy-gemini-no-key",
+          repositoryRoot: "/repo",
+          workspaceRoot: "/workspace",
+          instruction: "inspect only",
+          mode: "review",
+          timeoutMs: 60_000,
+          environment: { PATH: "/usr/bin:/bin" },
+        }),
+      (err: any) => err.code === "AGENT_NOT_AVAILABLE" && /GEMINI_API_KEY/.test(err.message)
+    );
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
 test("AgyAdapter extracts conversation_id from JSON and stream-json", () => {
   const adapter = new AgyAdapter({
     enabled: true,
@@ -538,4 +638,3 @@ test("AgyAdapter setupAgySettings fails closed when configuration directory cann
     fs.rmSync(tmpWorkspace, { recursive: true, force: true });
   }
 });
-

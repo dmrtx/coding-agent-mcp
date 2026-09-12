@@ -43,6 +43,25 @@ agents:
       - LC_ALL
       - TERM
 
+  # Direct Gemini API mode through the installed AGY CLI and agy-gyro retry
+  # proxy. This route does not use account OAuth or macOS Keychain.
+  agy-gemini:
+    enabled: false
+    executable: /path/to/agy-gyro
+    agy_executable: /path/to/agy
+    gyro_args: [] # e.g. ["--max-retries", "15"]
+    sandbox: true
+    default_timeout_seconds: 1800
+    env_allowlist:
+      - PATH
+      - TMPDIR
+      - USER
+      - SHELL
+      - LANG
+      - LC_ALL
+      - TERM
+      - GEMINI_API_KEY
+
   # Experimental additive Antigravity ACP adapter.
   # Disabled by default. Requires the operator to install/provide the official
   # `agy_acp_server` binary; there is no downloader. Legacy `agy` above

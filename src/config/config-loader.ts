@@ -90,9 +90,8 @@ export function loadConfig(customPath?: string, rawOverrides?: Partial<AppConfig
   // Normalize server data_dir
   config.server.data_dir = path.resolve(expandHome(config.server.data_dir));
 
-  // Normalize experimental agy-acp state_dir (phase 1 foundation only; the
-  // adapter that would consume it does not exist yet). May be absent when
-  // the operator lists an explicit `agents` subset without `agy-acp`.
+  // Normalize experimental agy-acp state_dir. May be absent when the
+  // operator lists an explicit `agents` subset without `agy-acp`.
   const agyAcp = (config.agents as Record<string, { state_dir?: string }>)["agy-acp"];
   if (agyAcp?.state_dir) {
     agyAcp.state_dir = path.resolve(expandHome(agyAcp.state_dir));

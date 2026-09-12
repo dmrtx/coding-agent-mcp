@@ -45,11 +45,14 @@ import {
  *   ACP kernel over stdio (used with the existing fake kernel fixture in
  *   tests) and drives `initialize -> session/new -> session/prompt`
  *   (or `initialize -> session/resume -> session/prompt` for continues).
- *   On the official kernel's narrow auth-required failure (JSON-RPC
+ *   Gemini API-key mode selects its configured auth method explicitly
+ *   before opening a session because the official kernel no longer treats
+ *   a bare `GEMINI_API_KEY` as provider selection. Other methods remain
+ *   lazy: on the official kernel's narrow auth-required failure (JSON-RPC
  *   -32000 mentioning authentication/`authenticate`), exactly one ACP
  *   `authenticate` (`{ methodId: <configured auth_method> }`) is sent
- *   and the session call is retried exactly once; never preemptively,
- *   never in a loop. Inbound `session/request_permission` probes are
+ *   and the session call is retried exactly once. Inbound
+ *   `session/request_permission` probes are
  *   answered with the real phase-1 `decideAcpToolPermission` policy
  *   (fail-closed when the mode/policy context is missing); there is no
  *   allow-all placeholder.
@@ -912,8 +915,19 @@ export class AgyAcpAdapter implements CodingAgent {
         try {
           await client.initialize({ protocolVersion: 1 });
           const authMethodId = this.getAuthMethodId();
-          const authenticateOnce = (): Promise<unknown> =>
-            client.authenticate({ methodId: authMethodId });
+          let authenticateAttempted = false;
+          const authenticateOnce = async (): Promise<void> => {
+            if (authenticateAttempted) return;
+            authenticateAttempted = true;
+            await client.authenticate({ methodId: authMethodId });
+          };
+          // The official ACP kernel explicitly states that a bare
+          // GEMINI_API_KEY no longer selects API-key auth. Select it before
+          // session/new or session/resume so a persisted OAuth profile can
+          // never silently win and reach the account-backed provider.
+          if (authMethodId === "gemini-api-key") {
+            await authenticateOnce();
+          }
           let sessionId: string;
           let sessionConfigOptions: unknown;
           if (resumeSessionId !== undefined) {

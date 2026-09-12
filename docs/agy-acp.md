@@ -14,7 +14,10 @@
   unsafe combination `mode: yolo` unless `allow_write_worktree: true`.
   When `auth_method: gemini-api-key`, an explicitly allowlisted
   `GEMINI_API_KEY` is forwarded to the isolated ACP process; all ambient
-  Google/Gemini/Antigravity credentials remain stripped in other modes.
+  Google/Gemini/Antigravity credentials remain stripped in other modes. The
+  adapter also selects `gemini-api-key` through ACP before opening or resuming
+  a session, preventing a persisted OAuth profile from silently taking
+  precedence over the configured API route.
 - Dependency-light ACP JSON-RPC/NDJSON protocol client under
   `src/agents/acp/` (incremental framing with bounded line size, numeric
   request ids with timeouts, response/notification/inbound-request handling,

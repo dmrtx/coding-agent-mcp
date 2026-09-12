@@ -155,6 +155,56 @@ test("session/new auth-required authenticates once with oauth-personal and retri
   }
 });
 
+test("gemini-api-key authenticates before session/new even when a session would already open", async () => {
+  assert.ok(fs.existsSync(FIXTURE));
+  const { workspace, cleanup } = makeWorkspace();
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-auth-gemini-"));
+  const adapter = new AgyAcpAdapter(
+    makeConfig({
+      state_dir: stateDir,
+      auth_method: "gemini-api-key",
+    })
+  );
+  const origNew = AcpClient.prototype.sessionNew;
+  const origAuth = AcpClient.prototype.authenticate;
+  const calls: string[] = [];
+  (AcpClient.prototype as unknown as Record<string, unknown>).sessionNew = function (
+    this: AcpClient,
+    params?: Record<string, unknown>,
+    options?: unknown
+  ) {
+    calls.push("session/new");
+    return origNew.call(this, params, options as never);
+  };
+  (AcpClient.prototype as unknown as Record<string, unknown>).authenticate = function (
+    this: AcpClient,
+    params?: Record<string, unknown>,
+    options?: unknown
+  ) {
+    calls.push(`authenticate:${String(params?.methodId)}`);
+    return origAuth.call(this, params ?? {}, options as never);
+  };
+  try {
+    const result = await adapter.runAcpTurn({
+      executable: process.execPath,
+      args: [FIXTURE],
+      prompt: "read the readme",
+      timeoutMs: 15_000,
+      workspaceRoot: workspace,
+      mode: "implement",
+      baseEnv: { GEMINI_API_KEY: "explicit-test-key" },
+    });
+    assert.deepEqual(calls.slice(0, 2), ["authenticate:gemini-api-key", "session/new"]);
+    assert.equal(calls.filter((call) => call.startsWith("authenticate:")).length, 1);
+    assert.ok(result.sessionId.startsWith("sess-"));
+  } finally {
+    (AcpClient.prototype as unknown as Record<string, unknown>).sessionNew = origNew;
+    (AcpClient.prototype as unknown as Record<string, unknown>).authenticate = origAuth;
+    cleanup();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("unrelated -32000 on session/new never triggers authenticate", async () => {
   assert.ok(fs.existsSync(FIXTURE));
   const { workspace, cleanup } = makeWorkspace();

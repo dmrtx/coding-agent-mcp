@@ -26,6 +26,18 @@ export const AgentConfigSchema = z.object({
   extra_args: z.array(z.string()).optional(),
 });
 
+// Direct AGY CLI execution through agy-gyro. This is intentionally separate
+// from both account-backed `agy` and the experimental ACP kernel adapter.
+export const AgyGeminiConfigSchema = AgentConfigSchema.extend({
+  enabled: z.boolean().default(false),
+  executable: z.string().min(1).default("agy-gyro"),
+  agy_executable: z.string().min(1).default("agy"),
+  gyro_args: z.array(z.string()).default([]),
+  env_allowlist: z
+    .array(z.string())
+    .default(["PATH", "TMPDIR", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "GEMINI_API_KEY"]),
+});
+
 // Experimental, opt-in Antigravity ACP integration. The adapter launches an
 // operator-provided ACP kernel (optionally through a wrapper such as
 // `agy-gyro`) over JSON-RPC/NDJSON and is managed by TaskManager. Legacy
@@ -96,18 +108,19 @@ export const AppConfigSchema = z.object({
   // Omission semantics match the historical z.record shape exactly: an
   // explicitly provided `agents` object keeps ONLY the keys the operator
   // listed (no backfilling of omitted agents). Whole-`agents` defaults
-  // (muse + agy + disabled agy-acp) apply solely when `agents` itself is
-  // omitted, via the outer `.default(...)` below.
+  // (muse + agy + disabled agy-gemini/agy-acp) apply solely when `agents`
+  // itself is omitted, via the outer `.default(...)` below.
   agents: z
     .object({
       muse: AgentConfigSchema.optional(),
       agy: AgentConfigSchema.optional(),
+      "agy-gemini": AgyGeminiConfigSchema.optional(),
       "agy-acp": AgyAcpConfigSchema.optional(),
     })
     // Union catchall: unknown agent keys keep legacy generic parsing, while
     // the union also keeps the object output (with its `agy-acp` member)
     // assignable for defaults.
-    .catchall(z.union([AgentConfigSchema, AgyAcpConfigSchema]))
+    .catchall(z.union([AgentConfigSchema, AgyGeminiConfigSchema, AgyAcpConfigSchema]))
     .default({
       muse: {
         enabled: true,
@@ -123,6 +136,15 @@ export const AppConfigSchema = z.object({
         default_timeout_seconds: 1800,
         env_allowlist: ["HOME", "PATH", "TMPDIR", "USER", "SHELL", "LANG", "LC_ALL", "TERM"],
       },
+      "agy-gemini": {
+        enabled: false,
+        executable: "agy-gyro",
+        agy_executable: "agy",
+        gyro_args: [],
+        sandbox: true,
+        default_timeout_seconds: 1800,
+        env_allowlist: ["PATH", "TMPDIR", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "GEMINI_API_KEY"],
+      },
       "agy-acp": {
         ...AGY_ACP_CONFIG_DEFAULTS,
         acp_args: [...AGY_ACP_CONFIG_DEFAULTS.acp_args],
@@ -135,6 +157,7 @@ export const AppConfigSchema = z.object({
 export type VerificationProfileConfig = z.infer<typeof VerificationProfileConfigSchema>;
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
+export type AgyGeminiConfig = z.infer<typeof AgyGeminiConfigSchema>;
 export type AgyAcpAuthMethod = z.infer<typeof AgyAcpAuthMethodSchema>;
 export type AgyAcpMode = z.infer<typeof AgyAcpModeSchema>;
 export type AgyAcpConfig = z.infer<typeof AgyAcpConfigSchema>;

@@ -29,6 +29,32 @@ test("existing agents.agy behavior is unchanged by agy-acp defaults", () => {
   assert.equal(parsed.agents.agy.sandbox, true);
   assert.equal(parsed.agents.muse.enabled, true);
   assert.equal(parsed.agents.muse.executable, "muse");
+  assert.equal(parsed.agents["agy-gemini"].enabled, false);
+  assert.equal(parsed.agents["agy-gemini"].executable, "agy-gyro");
+  assert.equal(parsed.agents["agy-gemini"].agy_executable, "agy");
+  assert.ok(parsed.agents["agy-gemini"].env_allowlist.includes("GEMINI_API_KEY"));
+});
+
+test("agy-gemini config parses direct CLI and Gyro settings", () => {
+  const parsed = AppConfigSchema.parse({
+    agents: {
+      "agy-gemini": {
+        enabled: true,
+        executable: "/opt/bin/agy-gyro",
+        agy_executable: "/opt/bin/agy",
+        gyro_args: ["--max-retries", "12"],
+        extra_args: ["--model", "gemini-3.8-flash-high"],
+      },
+    },
+  });
+  const config = parsed.agents["agy-gemini"];
+  assert.equal(config.enabled, true);
+  assert.equal(config.executable, "/opt/bin/agy-gyro");
+  assert.equal(config.agy_executable, "/opt/bin/agy");
+  assert.deepEqual(config.gyro_args, ["--max-retries", "12"]);
+  assert.deepEqual(config.extra_args, ["--model", "gemini-3.8-flash-high"]);
+  const registry = new AgentRegistry(parsed);
+  assert.equal(registry.getAgent("agy-gemini").displayName, "AGY Gemini (via Gyro)");
 });
 
 test("agy-acp rejects mode=yolo unless allow_write_worktree=true", () => {
@@ -129,10 +155,11 @@ test("AgentRegistry does not gain muse from an agy-only config", () => {
   );
 });
 
-test("omitted agents section keeps whole-agents defaults including disabled agy-acp", () => {
+test("omitted agents section keeps whole-agents defaults including disabled AGY variants", () => {
   const parsed = AppConfigSchema.parse({});
   assert.ok(parsed.agents.muse);
   assert.ok(parsed.agents.agy);
+  assert.equal(parsed.agents["agy-gemini"].enabled, false);
   assert.equal(parsed.agents["agy-acp"].enabled, false);
 });
 

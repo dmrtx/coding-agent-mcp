@@ -125,7 +125,7 @@ export class TaskManager {
         createdAt: new Date().toISOString(),
         logPath,
         // Agents that return sessions dynamically (like AGY) start as non-resumable until extracted
-        sessionResumable: params.agent === "agy" ? false : true,
+        sessionResumable: params.agent === "agy" || params.agent === "agy-gemini" ? false : true,
         outputTruncated: false,
       };
 

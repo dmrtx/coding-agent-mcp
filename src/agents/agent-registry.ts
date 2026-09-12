@@ -1,5 +1,5 @@
 import { CodingAgent, AgentDescriptor } from "../domain/agent.js";
-import { AppConfig, AgyAcpConfig } from "../config/schema.js";
+import { AppConfig, AgyAcpConfig, AgyGeminiConfig } from "../config/schema.js";
 import { MuseAdapter } from "./muse-adapter.js";
 import { AgyAdapter } from "./agy-adapter.js";
 import { AgyAcpAdapter } from "./agy-acp-adapter.js";
@@ -14,6 +14,23 @@ export class AgentRegistry {
     }
     if (config.agents.agy) {
       this.registerAgent(new AgyAdapter(config.agents.agy, config.server?.data_dir));
+    }
+    const agyGemini = (config.agents as Record<string, AgyGeminiConfig | undefined>)["agy-gemini"];
+    if (agyGemini) {
+      this.registerAgent(
+        new AgyAdapter(agyGemini, config.server?.data_dir, {
+          id: "agy-gemini",
+          displayName: "AGY Gemini (via Gyro)",
+          modelProvider: "gemini",
+          requiredExecutable: agyGemini.agy_executable ?? "agy",
+          commandPrefixArgs: [
+            ...(agyGemini.gyro_args ?? []),
+            "--agy-path",
+            agyGemini.agy_executable ?? "agy",
+            "--",
+          ],
+        })
+      );
     }
     // Phase 2A slice 1: `agy-acp` is opt-in and registered ONLY when
     // explicitly enabled. Legacy `muse`/`agy` handling above is unchanged.
